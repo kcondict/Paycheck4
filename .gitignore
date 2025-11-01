@@ -1,0 +1,22 @@
+# .NET build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Debug files
+*.pdb
+
+# Package files
+*.nupkg
+
+# User-specific files
+*.userprefs
+*.usertasks
+
+# Mono Auto Generated Files
+mono_crash.*
+
+# VS Code settings
+.vscode/
