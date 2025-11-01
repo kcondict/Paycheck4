@@ -69,16 +69,16 @@ chmod +x build.sh
 Options:
   -h, --help                 Show help message
   -c, --configuration        Set build configuration (Debug|Release) [default: Debug]
-  -r, --runtime             Set runtime identifier [default: linux-arm64]
-  -s, --self-contained      Build as self-contained application
-  -p, --publish             Publish the application instead of building
-  -o, --output             Set the output directory for publish
-  -d, --deploy             Deploy to remote host after build/publish
-  --host                   Remote host for deployment (e.g., 192.168.68.69)
-  --user                   Remote username for deployment
-  --clean                  Clean before building
-  --restore               Restore dependencies before building
-  -v, --verbosity         Set verbosity level (quiet|minimal|normal|detailed|diagnostic)
+  -r, --runtime              Set runtime identifier [default: linux-arm64]
+  -s, --self-contained       Build as self-contained application
+  -p, --publish              Publish the application instead of building
+  -o, --output               Set the output directory for publish
+  -d, --deploy               Deploy to remote host after build/publish
+  --host                     Remote host for deployment (e.g., 192.168.68.69)
+  --user                     Remote username for deployment
+  --clean                    Clean before building
+  --restore                  Restore dependencies before building
+  -v, --verbosity            Set verbosity level (quiet|minimal|normal|detailed|diagnostic)
 ```
 
 ### Examples
