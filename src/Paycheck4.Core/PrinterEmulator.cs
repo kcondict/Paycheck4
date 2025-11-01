@@ -67,10 +67,7 @@ namespace Paycheck4.Core
                 }).Wait();
 
                 // Initialize USB manager
-                Task.Run(async () =>
-                {
-                    await _usbManager.InitializeAsync();
-                }).Wait();
+                Task.Run(_usbManager.InitializeAsync).Wait();
 
                 // Initialize protocol handler
                 _protocol.Initialize();

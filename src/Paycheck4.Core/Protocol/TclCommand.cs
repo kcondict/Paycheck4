@@ -1,15 +1,3 @@
-#region Project Header
-/*  ____   __   __ __  ____ _  _ ____ ____ _  _  ___ 
- * (  _ \ /  \ /  /  )/ ___) )( (  __/ ___)/ )( \/ __)
- *  ) __/(  O (  O ) \\___ ) __ () _)\___ \) __ (/(__
- * (__)   \__/ \__/(__)(___\_)(_(__) (____/\_)(_/\___) 
- *
- * Paycheck4 - Nanoptix Printer Protocol Emulator
- * 
- * Copyright (c) 2025, Your Organization. All rights reserved.
- */
-#endregion
-
 using System;
 
 namespace Paycheck4.Core.Protocol
