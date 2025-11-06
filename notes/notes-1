@@ -1,0 +1,90 @@
+
+This suggests the reboot might have had an issue, possibly due to the USB configuration changes. Since the Pi is not reachable over the network, you'll need to:
+
+Connect a monitor and keyboard directly to the Pi if possible
+If that's not possible, you may need to:
+Power off the Pi completely (unplug power)
+Remove the SD card
+Mount it on another system to fix the configuration
+Or restore from a backup if available
+Would you like me to help with any of these recovery options? I can provide the exact configuration that should be in both the config.txt and cmdline.txt files once you have access to them.
+
+In the meantime, I can show you what the correct configuration files should look like so you can verify them when you regain access:
+
+config.txt should have:
+
+# Raspberry Pi 5 config
+[all]
+kernel=kernel8.img
+arm_64bit=1
+enable_uart=1
+
+# Enable USB device mode
+dtoverlay=rp5-usb-gadget
+dtoverlay=dwc2,dr_mode=peripheral
+
+# Boot config
+initramfs initrd.img-6.1.0-rpi4-rpi-v8
+cmdline=cmdline.txt
+
+
+cmdline.txt should have:
+
+console=serial0,115200 console=tty1 root=LABEL=rootfs rootfstype=ext4 fsck.repair=yes rootwait modules-load=dwc2,libcomposite
+
+
+Can you summarize the last change made to the pi before it went unreachable?
+
+Here were the last changes made before the Pi became unreachable:
+
+We modified config.txt to remove a duplicate dwc2 overlay entry
+We wrote a new cmdline.txt with USB module loading parameters:
+
+console=serial0,115200 console=tty1 root=LABEL=rootfs rootfstype=ext4 fsck.repair=yes rootwait modules-load=dwc2,libcomposite
+
+We manually loaded the overlays which succeeded:
+rp5-usb-gadget
+dwc2 with dr_mode=peripheral
+The libcomposite module was successfully loaded and showed as being used by g_printer. We saw the overlays were properly loaded in the dtoverlay -l output.
+
+Then we initiated a reboot to have everything load properly at boot time, and that's when the Pi became unreachable. The most likely issue is either:
+
+The cmdline.txt root parameter (LABEL=rootfs) might not match your actual root partition label
+Or there might be an issue with the USB configuration affecting the network interface during boot
+
+
+I understand. Here's what to check/fix when you connect the monitor to the Pi:
+
+If the Pi fails to boot:
+
+Press Shift during boot to enter recovery mode
+Or if needed, edit cmdline.txt to remove the problematic changes
+The original cmdline.txt content should have been preserved before we changed it
+If you get to a command prompt:
+
+Check /boot/firmware/cmdline.txt - remove the modules-load=dwc2,libcomposite if causing issues
+Check /boot/firmware/config.txt - ensure only one dwc2 overlay entry exists
+Most critical fix if needed:
+
+Remove or comment out the last changes we made to both files
+Let the Pi boot normally
+Then we can try a different approach when you return
+I'll be here when you get back and we can work on a safer approach to enabling the USB gadget mode.I understand. Here's what to check/fix when you connect the monitor to the Pi:
+
+If the Pi fails to boot:
+
+Press Shift during boot to enter recovery mode
+Or if needed, edit cmdline.txt to remove the problematic changes
+The original cmdline.txt content should have been preserved before we changed it
+If you get to a command prompt:
+
+Check /boot/firmware/cmdline.txt - remove the modules-load=dwc2,libcomposite if causing issues
+Check /boot/firmware/config.txt - ensure only one dwc2 overlay entry exists
+Most critical fix if needed:
+
+Remove or comment out the last changes we made to both files
+Let the Pi boot normally
+Then we can try a different approach when you return
+I'll be here when you get back and we can work on a safer approach to enabling the USB gadget mode.
+
+

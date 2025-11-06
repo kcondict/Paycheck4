@@ -79,9 +79,9 @@ namespace Paycheck4.Core
         /// <summary>
         /// Optional error message if status change was due to an error
         /// </summary>
-        public string ErrorMessage { get; }
+        public string? ErrorMessage { get; }
 
-        public PrinterStatusEventArgs(PrinterStatus oldStatus, PrinterStatus newStatus, string errorMessage = null)
+        public PrinterStatusEventArgs(PrinterStatus oldStatus, PrinterStatus newStatus, string? errorMessage = null)
         {
             OldStatus = oldStatus;
             NewStatus = newStatus;

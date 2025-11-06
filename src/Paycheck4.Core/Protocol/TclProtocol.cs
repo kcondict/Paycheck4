@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using System.Threading;
+using Microsoft.Extensions.Logging;
 
 namespace Paycheck4.Core.Protocol
 {
@@ -14,6 +15,11 @@ namespace Paycheck4.Core.Protocol
         /// <summary>
         /// Event raised when printer status changes
         /// </summary>
+        /// <remarks>
+        /// This event will be used when processing command responses that affect printer status
+        /// </remarks>
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CS0067:The event is never used", 
+            Justification = "Event will be used when command response handling is implemented")]
         public event EventHandler<PrinterStatusEventArgs>? StatusChanged;
         #endregion
 
@@ -32,16 +38,45 @@ namespace Paycheck4.Core.Protocol
         private readonly object _lock = new object();
         private readonly Queue<byte[]> _responseQueue = new Queue<byte[]>();
         private readonly AutoResetEvent _responseEvent = new AutoResetEvent(false);
+        private readonly ILogger<TclProtocol>? _logger;
+        private bool _extendedStatusSent = false;
+        
+        // Extended status data
+        private byte _unitAddress = 0x00;
+        private string _softwareVersion = "PAY-6.22B";
+        private byte _statusFlags1 = 0x40;
+        private byte _statusFlags2 = 0x40;
+        private byte _statusFlags3 = 0x40;
+        private byte _statusFlags4 = 0x40;
+        private byte _statusFlags5 = 0x71;
+        private string _tempNumber = "P9";
         
         /// <summary>
         /// Event raised when a TCL command is received and parsed
         /// </summary>
+        /// <remarks>
+        /// This event will be used when command parsing is implemented
+        /// </remarks>
+        [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CS0067:The event is never used", 
+            Justification = "Event will be used when command parsing is implemented")]
         public event EventHandler<TclCommandEventArgs>? CommandReceived;
 
         /// <summary>
         /// Event raised when printer status should be reported
         /// </summary>
         public event EventHandler<TclStatusRequestEventArgs>? StatusRequested;
+        
+        /// <summary>
+        /// Event raised when a response needs to be sent to the host
+        /// </summary>
+        public event EventHandler<TclResponseEventArgs>? ResponseReady;
+        #endregion
+        
+        #region Constructor
+        public TclProtocol(ILogger<TclProtocol>? logger = null)
+        {
+            _logger = logger;
+        }
         #endregion
 
         #region Status Flags
@@ -162,7 +197,19 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         public void Initialize()
         {
-            // Initialize protocol state
+            // Send extended status immediately
+            SendExtendedStatusResponse();
+            
+            // Send status every 1 second continuously
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    await Task.Delay(1000);
+                    _logger?.LogInformation("Sending periodic extended status");
+                    SendExtendedStatusResponse();
+                }
+            });
         }
 
         /// <summary>
@@ -170,7 +217,55 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         public void ProcessData(byte[] data, int offset, int count)
         {
+            // Mark that we've received data (host is connected)
+            _extendedStatusSent = true;
+            
             // Process incoming data
+        }
+        
+        /// <summary>
+        /// Sends an extended status response to the host
+        /// </summary>
+        private void SendExtendedStatusResponse()
+        {
+            _logger?.LogInformation("Building and sending extended status response");
+            var response = BuildExtendedStatusResponse();
+            
+            // Log the response bytes
+            var hexString = BitConverter.ToString(response).Replace("-", " ");
+            _logger?.LogInformation("Extended status response: {ByteCount} bytes - {HexData}", response.Length, hexString);
+            
+            ResponseReady?.Invoke(this, new TclResponseEventArgs(response));
+        }
+        
+        /// <summary>
+        /// Builds an extended status response according to TCL protocol
+        /// Format: *S|0|PAY-6.22B|flag1|flag2|flag3|flag4|flag5|P9|*
+        /// Flags are single binary bytes, other fields are ASCII strings
+        /// </summary>
+        private byte[] BuildExtendedStatusResponse()
+        {
+            // Build the response manually with mix of ASCII and binary
+            var response = new List<byte>();
+            
+            // Start delimiter and unit address (ASCII)
+            response.AddRange(Encoding.ASCII.GetBytes($"*S|{_unitAddress}|{_softwareVersion}|"));
+            
+            // Status flags (binary bytes)
+            response.Add(_statusFlags1);
+            response.Add((byte)'|');
+            response.Add(_statusFlags2);
+            response.Add((byte)'|');
+            response.Add(_statusFlags3);
+            response.Add((byte)'|');
+            response.Add(_statusFlags4);
+            response.Add((byte)'|');
+            response.Add(_statusFlags5);
+            
+            // Temp number and end delimiter (ASCII)
+            response.AddRange(Encoding.ASCII.GetBytes($"|{_tempNumber}|*"));
+            
+            return response.ToArray();
         }
         #endregion
 
@@ -225,6 +320,19 @@ namespace Paycheck4.Core.Protocol
     public class TclStatusRequestEventArgs : EventArgs
     {
         public PrinterStatus Status { get; set; }
+    }
+    
+    /// <summary>
+    /// Event arguments for response data ready to send
+    /// </summary>
+    public class TclResponseEventArgs : EventArgs
+    {
+        public byte[] Response { get; }
+        
+        public TclResponseEventArgs(byte[] response)
+        {
+            Response = response;
+        }
     }
 
     /// <summary>

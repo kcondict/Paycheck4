@@ -1,8 +1,11 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Paycheck4.Console.Configuration;
 using Paycheck4.Core;
+using Paycheck4.Core.Protocol;
+using Paycheck4.Core.Usb;
 using Serilog;
 using Serilog.Settings.Configuration;
 
@@ -60,9 +63,15 @@ namespace Paycheck4.Console
                     services.Configure<PrinterConfig>(
                         hostContext.Configuration.GetSection("Printer"));
 
-                    // Core services
+                    // Core services  
                     services.AddHostedService<PrinterEmulatorService>();
-                    services.AddSingleton<IPrinterEmulator, PrinterEmulator>();
+                    services.AddSingleton<IPrinterEmulator>(sp =>
+                    {
+                        var logger = sp.GetRequiredService<ILogger<PrinterEmulator>>();
+                        var usbLogger = sp.GetRequiredService<ILogger<UsbGadgetManager>>();
+                        var protocolLogger = sp.GetRequiredService<ILogger<TclProtocol>>();
+                        return new PrinterEmulator(logger, usbLogger, protocolLogger);
+                    });
                 })
                 .UseSerilog();
     }
