@@ -11,11 +11,13 @@ namespace Paycheck4.Core.Tests
     {
         private readonly Mock<ILogger<PrinterEmulator>> _mockLogger;
         private readonly Mock<ILogger<UsbGadgetManager>> _mockUsbLogger;
+        private readonly Mock<ILogger<TclProtocol>> _mockProtocolLogger;
 
         public PrinterEmulatorTests()
         {
             _mockLogger = new Mock<ILogger<PrinterEmulator>>();
             _mockUsbLogger = new Mock<ILogger<UsbGadgetManager>>();
+            _mockProtocolLogger = new Mock<ILogger<TclProtocol>>();
         }
 
         // Note: Most tests are disabled because they require actual hardware (/dev/ttyGS0)
@@ -26,7 +28,7 @@ namespace Paycheck4.Core.Tests
         {
             // Act & Assert
             var exception = Record.Exception(() => 
-                new PrinterEmulator(_mockLogger.Object, _mockUsbLogger.Object));
+                new PrinterEmulator(_mockLogger.Object, _mockUsbLogger.Object, _mockProtocolLogger.Object));
             
             Assert.Null(exception);
         }
@@ -36,7 +38,7 @@ namespace Paycheck4.Core.Tests
         {
             // Act & Assert
             Assert.Throws<ArgumentNullException>(() => 
-                new PrinterEmulator(null!, _mockUsbLogger.Object));
+                new PrinterEmulator(null!, _mockUsbLogger.Object, _mockProtocolLogger.Object));
         }
 
         [Fact]
@@ -44,7 +46,15 @@ namespace Paycheck4.Core.Tests
         {
             // Act & Assert
             Assert.Throws<ArgumentNullException>(() => 
-                new PrinterEmulator(_mockLogger.Object, null!));
+                new PrinterEmulator(_mockLogger.Object, null!, _mockProtocolLogger.Object));
+        }
+
+        [Fact]
+        public void Constructor_WithNullProtocolLogger_ThrowsArgumentNullException()
+        {
+            // Act & Assert
+            Assert.Throws<ArgumentNullException>(() => 
+                new PrinterEmulator(_mockLogger.Object, _mockUsbLogger.Object, null!));
         }
 
         // Integration tests would go here - require hardware

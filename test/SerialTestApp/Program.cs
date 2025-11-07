@@ -30,6 +30,7 @@ class Program
 			Console.WriteLine($"✓ Connected to {portName}");
 			Console.WriteLine();
 			Console.WriteLine("Commands:");
+			Console.WriteLine("  p - Send test print command");
 			Console.WriteLine("  Type text and press Enter to send");
 			Console.WriteLine("  Type 'exit' to quit");
 			Console.WriteLine("  Type 'hex:<bytes>' to send hex (e.g., hex:48656C6C6F)");
@@ -85,7 +86,16 @@ class Program
 
 				try
 				{
-					if (input.StartsWith("hex:", StringComparison.OrdinalIgnoreCase))
+					if (input.Equals("p", StringComparison.OrdinalIgnoreCase))
+					{
+						// Send test print command: ^P|9|1|Field1|Field2|Field3|Field4|^
+						var printCommand = "^P|9|1|John Doe|$100.00|Check #12345|11/07/2025|^";
+						var bytes = Encoding.ASCII.GetBytes(printCommand);
+						port.Write(bytes, 0, bytes.Length);
+						Console.WriteLine($"[TX] Print command: {printCommand}");
+						Console.WriteLine($"     {bytes.Length} bytes: {BitConverter.ToString(bytes).Replace("-", " ")}");
+					}
+					else if (input.StartsWith("hex:", StringComparison.OrdinalIgnoreCase))
 					{
 						// Send hex bytes
 						var hexString = input.Substring(4).Replace(" ", "").Replace("-", "");

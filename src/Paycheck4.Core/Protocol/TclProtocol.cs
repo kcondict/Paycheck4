@@ -44,11 +44,11 @@ namespace Paycheck4.Core.Protocol
         // Extended status data
         private byte _unitAddress = 0x00;
         private string _softwareVersion = "PAY-6.22B";
-        private byte _statusFlags1 = 0x40;
-        private byte _statusFlags2 = 0x40;
-        private byte _statusFlags3 = 0x40;
-        private byte _statusFlags4 = 0x40;
-        private byte _statusFlags5 = 0x71;
+        private byte _statusFlags1 = (byte)StatusFlag1.Unmask;
+        private byte _statusFlags2 = (byte)StatusFlag2.Unmask;
+        private byte _statusFlags3 = (byte)StatusFlag3.Unmask;
+        private byte _statusFlags4 = (byte)StatusFlag4.Unmask;
+        private byte _statusFlags5 = (byte)(StatusFlag5.Unmask | StatusFlag5.ValidationDone | StatusFlag5.AtTopOfForm | StatusFlag5.ResetPowerUp);
         private string _tempNumber = "P9";
         
         /// <summary>
@@ -118,6 +118,30 @@ namespace Paycheck4.Core.Protocol
             PrinterOffline = 0x02,
             MissingSupplyIndex = 0x01
         }
+
+        [Flags]
+        public enum StatusFlag4 : byte
+        {
+            Mask = 0x0f,
+            Unmask = 0x40,
+            JournalPrintMode = 0x80,
+            Reserved = 0x40,
+            PaperJam = 0x20,
+            PaperLow = 0x01
+        }
+
+        [Flags]
+        public enum StatusFlag5 : byte
+        {
+            Mask = 0x3f,
+            Unmask = 0x40,
+            ValidationDone = 0x20,
+            AtTopOfForm = 0x10,
+            XedOff = 0x08,
+            PrinterOpen = 0x04,
+            BarcodeDataIsAccessed = 0x02,
+            ResetPowerUp = 0x01
+        }
         #endregion
 
         #region Message Processing
@@ -126,10 +150,82 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         public void ProcessIncomingData(byte[] data, int offset, int count)
         {
-            // Buffer until we have a complete command
-            // Parse command and raise appropriate events
-            // Handle status requests immediately
-            // Queue responses as needed
+            // Mark that we've received data (host is connected)
+            _extendedStatusSent = true;
+            
+            // Convert to string for command parsing
+            var message = Encoding.ASCII.GetString(data, offset, count);
+            _logger?.LogInformation("Received data from host: {Message}", message);
+            
+            // Check for print template command
+            if (message.StartsWith("^P|") && message.EndsWith("|^"))
+            {
+                var printCommand = ParsePrintTemplateCommand(message);
+                if (printCommand != null)
+                {
+                    _logger?.LogInformation("Print command detected: Template={Template}, Copies={Copies}, Fields={FieldCount}",
+                        printCommand.TemplateId, printCommand.Copies, printCommand.PrintFields.Count);
+                    
+                    // TODO: Raise event or handle print command
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Parses a print template command
+        /// Format: ^P|<template_id>|<copies>|<pr1_data>|<pr2_data>|...|prN_data|^
+        /// </summary>
+        private PrintTemplateCommand? ParsePrintTemplateCommand(string message)
+        {
+            try
+            {
+                // Remove start/end delimiters
+                if (!message.StartsWith("^P|") || !message.EndsWith("|^"))
+                    return null;
+                
+                var content = message.Substring(3, message.Length - 5); // Remove "^P|" and "|^"
+                var parts = content.Split('|');
+                
+                if (parts.Length < 2)
+                {
+                    _logger?.LogWarning("Invalid print command: insufficient fields");
+                    return null;
+                }
+                
+                // Parse template ID (single character)
+                if (parts[0].Length != 1)
+                {
+                    _logger?.LogWarning("Invalid template ID: {TemplateId}", parts[0]);
+                    return null;
+                }
+                char templateId = parts[0][0];
+                
+                // Parse copies (1-4 digits, 1-9999)
+                if (!int.TryParse(parts[1], out int copies) || copies < 1 || copies > 9999)
+                {
+                    _logger?.LogWarning("Invalid copies value: {Copies}", parts[1]);
+                    return null;
+                }
+                
+                // Collect print data fields (remaining parts)
+                var printFields = new List<string>();
+                for (int i = 2; i < parts.Length; i++)
+                {
+                    printFields.Add(parts[i]);
+                }
+                
+                return new PrintTemplateCommand
+                {
+                    TemplateId = templateId,
+                    Copies = copies,
+                    PrintFields = printFields
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Error parsing print template command");
+                return null;
+            }
         }
 
         /// <summary>
@@ -200,12 +296,12 @@ namespace Paycheck4.Core.Protocol
             // Send extended status immediately
             SendExtendedStatusResponse();
             
-            // Send status every 1 second continuously
+            // Send status every 5 seconds continuously
             _ = Task.Run(async () =>
             {
                 while (true)
                 {
-                    await Task.Delay(1000);
+                    await Task.Delay(5000);
                     _logger?.LogInformation("Sending periodic extended status");
                     SendExtendedStatusResponse();
                 }
@@ -220,7 +316,8 @@ namespace Paycheck4.Core.Protocol
             // Mark that we've received data (host is connected)
             _extendedStatusSent = true;
             
-            // Process incoming data
+            // Process the incoming data
+            ProcessIncomingData(data, offset, count);
         }
         
         /// <summary>
@@ -347,5 +444,26 @@ namespace Paycheck4.Core.Protocol
         Reset,
         ClearError,
         SelfTest
+    }
+    
+    /// <summary>
+    /// Represents a parsed print template command
+    /// </summary>
+    public class PrintTemplateCommand
+    {
+        /// <summary>
+        /// Template ID (single character)
+        /// </summary>
+        public char TemplateId { get; set; }
+        
+        /// <summary>
+        /// Number of copies to print (1-9999)
+        /// </summary>
+        public int Copies { get; set; }
+        
+        /// <summary>
+        /// Variable data fields for the template
+        /// </summary>
+        public List<string> PrintFields { get; set; } = new List<string>();
     }
 }
