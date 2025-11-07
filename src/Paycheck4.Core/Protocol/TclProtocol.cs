@@ -40,6 +40,12 @@ namespace Paycheck4.Core.Protocol
         private readonly AutoResetEvent _responseEvent = new AutoResetEvent(false);
         private readonly ILogger<TclProtocol>? _logger;
         private bool _extendedStatusSent = false;
+        private bool _isRunning = false;
+        
+        // Message buffering for handling partial messages
+        private readonly System.Text.StringBuilder _messageBuffer = new System.Text.StringBuilder();
+        private DateTime _lastReceiveTime = DateTime.MinValue;
+        private const int MessageTimeoutMs = 10;
         
         // Extended status data
         private byte _unitAddress = 0x00;
@@ -153,13 +159,158 @@ namespace Paycheck4.Core.Protocol
             // Mark that we've received data (host is connected)
             _extendedStatusSent = true;
             
-            // Convert to string for command parsing
-            var message = Encoding.ASCII.GetString(data, offset, count);
-            _logger?.LogInformation("Received data from host: {Message}", message);
-            
-            // Check for print template command
-            if (message.StartsWith("^P|") && message.EndsWith("|^"))
+            // Append raw bytes to buffer by decoding in-place
+            for (int i = 0; i < count; i++)
             {
+                _messageBuffer.Append((char)data[offset + i]);
+            }
+            _lastReceiveTime = DateTime.UtcNow;
+            
+            // Try to extract complete messages (start with '^' and end with '^')
+            ProcessBufferedMessages();
+        }
+        
+        /// <summary>
+        /// Process complete messages from the buffer
+        /// </summary>
+        private void ProcessBufferedMessages()
+        {
+            int lastCompleteMessageStart = -1;
+            int lastCompleteMessageEnd = -1;
+            int discardedMessageCount = 0;
+            
+            // First pass: find ALL complete messages and only keep the last one
+            int searchStart = 0;
+            while (searchStart < _messageBuffer.Length)
+            {
+                var bufferLength = _messageBuffer.Length;
+                
+                // Find start of message
+                int startIndex = -1;
+                for (int i = searchStart; i < bufferLength; i++)
+                {
+                    if (_messageBuffer[i] == '^')
+                    {
+                        startIndex = i;
+                        break;
+                    }
+                }
+                
+                if (startIndex == -1)
+                    break;
+                
+                // Find end of message (second '^')
+                int endIndex = -1;
+                for (int i = startIndex + 1; i < bufferLength; i++)
+                {
+                    if (_messageBuffer[i] == '^')
+                    {
+                        endIndex = i;
+                        break;
+                    }
+                }
+                
+                if (endIndex == -1)
+                {
+                    // Incomplete message at end - will handle below
+                    break;
+                }
+                
+                // Found a complete message
+                if (lastCompleteMessageStart != -1)
+                {
+                    // We already had a complete message, this means we're discarding the previous one
+                    discardedMessageCount++;
+                }
+                
+                lastCompleteMessageStart = startIndex;
+                lastCompleteMessageEnd = endIndex;
+                searchStart = endIndex + 1;
+            }
+            
+            // Handle the results
+            if (lastCompleteMessageStart != -1 && lastCompleteMessageEnd != -1)
+            {
+                // We have at least one complete message - process only the last one
+                if (discardedMessageCount > 0)
+                {
+                    _logger?.LogWarning("Discarding {Count} old command message(s), processing only the most recent", discardedMessageCount);
+                }
+                
+                // Log complete message (only allocation here is for logging)
+                if (_logger != null && _logger.IsEnabled(LogLevel.Information))
+                {
+                    var messageLength = lastCompleteMessageEnd - lastCompleteMessageStart + 1;
+                    var message = _messageBuffer.ToString(lastCompleteMessageStart, messageLength);
+                    _logger.LogInformation("Received complete message from host: {Message}", message);
+                }
+                
+                // Process the last complete message
+                ProcessCompleteMessage(lastCompleteMessageStart, lastCompleteMessageEnd);
+                
+                // Remove everything up to and including the last processed message
+                // This preserves any incomplete message that may be after it
+                _messageBuffer.Remove(0, lastCompleteMessageEnd + 1);
+                
+                // Reset the receive time for the remaining buffer (incomplete message)
+                if (_messageBuffer.Length > 0)
+                {
+                    _lastReceiveTime = DateTime.UtcNow;
+                }
+            }
+            else
+            {
+                // No complete messages found
+                var bufferLength = _messageBuffer.Length;
+                
+                if (bufferLength > 0 && (DateTime.UtcNow - _lastReceiveTime).TotalMilliseconds > MessageTimeoutMs)
+                {
+                    _logger?.LogError("Incomplete message received (timeout) - discarding {Length} bytes", bufferLength);
+                    _messageBuffer.Clear();
+                }
+                else if (bufferLength > 0)
+                {
+                    // Find if there's a start marker
+                    int startIndex = -1;
+                    for (int i = 0; i < bufferLength; i++)
+                    {
+                        if (_messageBuffer[i] == '^')
+                        {
+                            startIndex = i;
+                            break;
+                        }
+                    }
+                    
+                    // Remove junk before the start marker
+                    if (startIndex > 0)
+                    {
+                        _messageBuffer.Remove(0, startIndex);
+                    }
+                    else if (startIndex == -1 && (DateTime.UtcNow - _lastReceiveTime).TotalMilliseconds > MessageTimeoutMs)
+                    {
+                        _logger?.LogError("No message start marker found (timeout) - discarding {Length} bytes", bufferLength);
+                        _messageBuffer.Clear();
+                    }
+                }
+            }
+        }
+        
+        /// <summary>
+        /// Process a complete TCL message using buffer indices (no string allocation)
+        /// </summary>
+        private void ProcessCompleteMessage(int startIndex, int endIndex)
+        {
+            // Check message type by examining buffer directly
+            // Pattern: ^P|... for print command
+            if (endIndex - startIndex >= 3 && 
+                _messageBuffer[startIndex] == '^' &&
+                _messageBuffer[startIndex + 1] == 'P' &&
+                _messageBuffer[startIndex + 2] == '|' &&
+                _messageBuffer[endIndex - 1] == '|' &&
+                _messageBuffer[endIndex] == '^')
+            {
+                // Only allocate string when we need to parse it
+                var message = _messageBuffer.ToString(startIndex, endIndex - startIndex + 1);
                 var printCommand = ParsePrintTemplateCommand(message);
                 if (printCommand != null)
                 {
@@ -167,6 +318,15 @@ namespace Paycheck4.Core.Protocol
                         printCommand.TemplateId, printCommand.Copies, printCommand.PrintFields.Count);
                     
                     // TODO: Raise event or handle print command
+                }
+            }
+            else
+            {
+                // Unknown command - only allocate for logging
+                if (_logger != null && _logger.IsEnabled(LogLevel.Warning))
+                {
+                    var message = _messageBuffer.ToString(startIndex, endIndex - startIndex + 1);
+                    _logger.LogWarning("Unknown or unsupported command: {Message}", message);
                 }
             }
         }
@@ -293,19 +453,46 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         public void Initialize()
         {
-            // Send extended status immediately
+            // Don't send status yet - wait for Start()
+            _logger?.LogInformation("TCL protocol initialized - status broadcasting will begin when started");
+        }
+        
+        /// <summary>
+        /// Starts the TCL protocol handler and begins status broadcasting
+        /// </summary>
+        public void Start()
+        {
+            if (_isRunning)
+                return;
+                
+            _isRunning = true;
+            _logger?.LogInformation("Starting TCL protocol - beginning status broadcast");
+            
+            // Send initial status immediately
             SendExtendedStatusResponse();
             
             // Send status every 5 seconds continuously
             _ = Task.Run(async () =>
             {
-                while (true)
+                while (_isRunning)
                 {
                     await Task.Delay(5000);
-                    _logger?.LogInformation("Sending periodic extended status");
-                    SendExtendedStatusResponse();
+                    if (_isRunning)
+                    {
+                        _logger?.LogInformation("Sending periodic extended status");
+                        SendExtendedStatusResponse();
+                    }
                 }
             });
+        }
+        
+        /// <summary>
+        /// Stops the TCL protocol handler
+        /// </summary>
+        public void Stop()
+        {
+            _isRunning = false;
+            _logger?.LogInformation("TCL protocol stopped - status broadcasting halted");
         }
 
         /// <summary>

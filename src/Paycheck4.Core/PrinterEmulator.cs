@@ -91,11 +91,18 @@ namespace Paycheck4.Core
 
             _logger.LogInformation("Starting printer emulator");
             Status = PrinterStatus.Running;
+            
+            // Start the protocol handler (begins status broadcasting)
+            _protocol.Start();
         }
 
         public void Stop()
         {
             _logger.LogInformation("Stopping printer emulator");
+            
+            // Stop the protocol handler first
+            _protocol.Stop();
+            
             Status = PrinterStatus.Stopped;
         }
 
