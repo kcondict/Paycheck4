@@ -70,7 +70,23 @@ namespace Paycheck4.Console
                         var logger = sp.GetRequiredService<ILogger<PrinterEmulator>>();
                         var usbLogger = sp.GetRequiredService<ILogger<UsbGadgetManager>>();
                         var protocolLogger = sp.GetRequiredService<ILogger<TclProtocol>>();
-                        return new PrinterEmulator(logger, usbLogger, protocolLogger);
+                        
+                        // Get protocol configuration values
+                        var statusReportingInterval = hostContext.Configuration.GetValue<int>("Protocol:StatusReportingInterval", 5000);
+                        var printStartDelayInterval = hostContext.Configuration.GetValue<int>("Protocol:PrintStartDelayInterval", 3000);
+                        var validationDelayInterval = hostContext.Configuration.GetValue<int>("Protocol:ValidationDelayInterval", 18000);
+                        var busyStateChangeInterval = hostContext.Configuration.GetValue<int>("Protocol:BusyStateChangeInterval", 20000);
+                        var tofStateChangeInterval = hostContext.Configuration.GetValue<int>("Protocol:TOFStateChangeInterval", 4000);
+                        
+                        return new PrinterEmulator(
+                            logger, 
+                            usbLogger, 
+                            protocolLogger, 
+                            statusReportingInterval,
+                            printStartDelayInterval,
+                            validationDelayInterval,
+                            busyStateChangeInterval,
+                            tofStateChangeInterval);
                     });
                 })
                 .UseSerilog();

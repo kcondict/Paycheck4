@@ -26,5 +26,10 @@ namespace Paycheck4.Console.Configuration
     {
         public int BufferSize { get; set; } = 4096;
         public int ResponseTimeout { get; set; } = 5000;
+        public int StatusReportingInterval { get; set; } = 5000;
+        public int PrintStartDelayInterval { get; set; } = 3000;
+        public int ValidationDelayInterval { get; set; } = 18000;
+        public int BusyStateChangeInterval { get; set; } = 20000;
+        public int TOFStateChangeInterval { get; set; } = 4000;
     }
 }

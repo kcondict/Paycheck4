@@ -125,6 +125,7 @@
 
 ## Tech Stack
 - C# as the primary programming language
-- .NET framework for application development
+- .NET 8.0 for cross-platform application development
 - Use of standard libraries and NuGet packages
 - Target platform is embedded (Raspberry Pi 5 running Debian 12)
+- Deploy as self-contained linux-arm64 runtime

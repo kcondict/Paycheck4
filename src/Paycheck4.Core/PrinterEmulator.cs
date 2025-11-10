@@ -43,11 +43,22 @@ namespace Paycheck4.Core
         public PrinterEmulator(
             ILogger<PrinterEmulator> logger,
             ILogger<UsbGadgetManager> usbLogger,
-            ILogger<TclProtocol> protocolLogger)
+            ILogger<TclProtocol> protocolLogger,
+            int statusReportingInterval = 2000,
+            int printStartDelayInterval = 3000,
+            int validationDelayInterval = 18000,
+            int busyStateChangeInterval = 20000,
+            int tofStateChangeInterval = 4000)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _usbManager = new UsbGadgetManager(usbLogger ?? throw new ArgumentNullException(nameof(usbLogger)));
-            _protocol = new TclProtocol(protocolLogger ?? throw new ArgumentNullException(nameof(protocolLogger)));
+            _protocol = new TclProtocol(
+                protocolLogger ?? throw new ArgumentNullException(nameof(protocolLogger)), 
+                statusReportingInterval,
+                printStartDelayInterval,
+                validationDelayInterval,
+                busyStateChangeInterval,
+                tofStateChangeInterval);
 
             // Wire up event handlers
             _usbManager.DataReceived += OnUsbDataReceived;

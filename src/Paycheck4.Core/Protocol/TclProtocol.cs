@@ -41,11 +41,20 @@ namespace Paycheck4.Core.Protocol
         private readonly ILogger<TclProtocol>? _logger;
         private bool _extendedStatusSent = false;
         private bool _isRunning = false;
+        private int _statusReportingInterval = 5000;
         
         // Message buffering for handling partial messages
         private readonly System.Text.StringBuilder _messageBuffer = new System.Text.StringBuilder();
         private DateTime _lastReceiveTime = DateTime.MinValue;
         private const int MessageTimeoutMs = 10;
+        
+        // Print state machine
+        private PrintState _currentPrintState = PrintState.IdleTOF;
+        private System.Threading.Timer? _printStateTimer;
+        private readonly int _printStartDelayInterval;
+        private readonly int _validationDelayInterval;
+        private readonly int _busyStateChangeInterval;
+        private readonly int _tofStateChangeInterval;
         
         // Extended status data
         private byte _unitAddress = 0x00;
@@ -79,9 +88,20 @@ namespace Paycheck4.Core.Protocol
         #endregion
         
         #region Constructor
-        public TclProtocol(ILogger<TclProtocol>? logger = null)
+        public TclProtocol(
+            ILogger<TclProtocol>? logger = null, 
+            int statusReportingInterval = 2000,
+            int printStartDelayInterval = 3000,
+            int validationDelayInterval = 18000,
+            int busyStateChangeInterval = 20000,
+            int tofStateChangeInterval = 4000)
         {
             _logger = logger;
+            _statusReportingInterval = statusReportingInterval;
+            _printStartDelayInterval = printStartDelayInterval;
+            _validationDelayInterval = validationDelayInterval;
+            _busyStateChangeInterval = busyStateChangeInterval;
+            _tofStateChangeInterval = tofStateChangeInterval;
         }
         #endregion
 
@@ -147,6 +167,17 @@ namespace Paycheck4.Core.Protocol
             PrinterOpen = 0x04,
             BarcodeDataIsAccessed = 0x02,
             ResetPowerUp = 0x01
+        }
+        
+        /// <summary>
+        /// Print state machine states
+        /// </summary>
+        private enum PrintState
+        {
+            IdleTOF,
+            BusyNotTOFValClear,
+            BusyValDone,
+            IdleNotTOF
         }
         #endregion
 
@@ -317,7 +348,8 @@ namespace Paycheck4.Core.Protocol
                     _logger?.LogInformation("Print command detected: Template={Template}, Copies={Copies}, Fields={FieldCount}",
                         printCommand.TemplateId, printCommand.Copies, printCommand.PrintFields.Count);
                     
-                    // TODO: Raise event or handle print command
+                    // Start the print job state machine
+                    StartPrintJob();
                 }
             }
             else
@@ -421,18 +453,121 @@ namespace Paycheck4.Core.Protocol
         }
         #endregion
 
+        #region Print State Machine
+        /// <summary>
+        /// Starts the print job state machine
+        /// </summary>
+        private void StartPrintJob()
+        {
+            if (_currentPrintState != PrintState.IdleTOF)
+            {
+                _logger?.LogError("Print command received while printer is busy (State: {State}). Ignoring command.", _currentPrintState);
+                return;
+            }
+            
+            _logger?.LogInformation("Starting print job - transitioning from IdleTOF, starting PrintStartDelayTimer ({Interval}ms)", _printStartDelayInterval);
+            
+            // Start the print start delay timer
+            _printStateTimer?.Dispose();
+            _printStateTimer = new System.Threading.Timer(
+                _ => TransitionToBusyNotTOFValClear(),
+                null,
+                _printStartDelayInterval,
+                Timeout.Infinite);
+        }
+        
+        /// <summary>
+        /// Transition to BusyNotTOFValClear state
+        /// </summary>
+        private void TransitionToBusyNotTOFValClear()
+        {
+            _currentPrintState = PrintState.BusyNotTOFValClear;
+            
+            // Set Busy flag, Clear ValidationDone and AtTopOfForm flags
+            _statusFlags1 |= (byte)StatusFlag1.Busy;
+            _statusFlags5 &= (byte)~StatusFlag5.ValidationDone;
+            _statusFlags5 &= (byte)~StatusFlag5.AtTopOfForm;
+            
+            _logger?.LogInformation("Transitioned to BusyNotTOFValClear - Busy=SET, ValidationDone=CLEAR, AtTopOfForm=CLEAR. Starting ValidationDelayTimer ({Interval}ms)", _validationDelayInterval);
+            
+            // Start validation delay timer
+            _printStateTimer?.Dispose();
+            _printStateTimer = new System.Threading.Timer(
+                _ => TransitionToBusyValDone(),
+                null,
+                _validationDelayInterval,
+                Timeout.Infinite);
+        }
+        
+        /// <summary>
+        /// Transition to BusyValDone state
+        /// </summary>
+        private void TransitionToBusyValDone()
+        {
+            _currentPrintState = PrintState.BusyValDone;
+            
+            // Set ValidationDone flag
+            _statusFlags5 |= (byte)StatusFlag5.ValidationDone;
+            
+            _logger?.LogInformation("Transitioned to BusyValDone - ValidationDone=SET. Starting BusyStateChangeTimer ({Interval}ms)", _busyStateChangeInterval);
+            
+            // Start busy state change timer
+            _printStateTimer?.Dispose();
+            _printStateTimer = new System.Threading.Timer(
+                _ => TransitionToIdleNotTOF(),
+                null,
+                _busyStateChangeInterval,
+                Timeout.Infinite);
+        }
+        
+        /// <summary>
+        /// Transition to IdleNotTOF state
+        /// </summary>
+        private void TransitionToIdleNotTOF()
+        {
+            _currentPrintState = PrintState.IdleNotTOF;
+            
+            // Clear Busy flag
+            _statusFlags1 &= (byte)~StatusFlag1.Busy;
+            
+            _logger?.LogInformation("Transitioned to IdleNotTOF - Busy=CLEAR. Starting AtTOFTimer ({Interval}ms)", _tofStateChangeInterval);
+            
+            // Start TOF timer
+            _printStateTimer?.Dispose();
+            _printStateTimer = new System.Threading.Timer(
+                _ => TransitionToIdleTOF(),
+                null,
+                _tofStateChangeInterval,
+                Timeout.Infinite);
+        }
+        
+        /// <summary>
+        /// Transition to IdleTOF state
+        /// </summary>
+        private void TransitionToIdleTOF()
+        {
+            _currentPrintState = PrintState.IdleTOF;
+            
+            // Set AtTopOfForm flag
+            _statusFlags5 |= (byte)StatusFlag5.AtTopOfForm;
+            
+            _logger?.LogInformation("Transitioned to IdleTOF - AtTopOfForm=SET. Print job complete, ready for next command.");
+            
+            // Dispose timer (no next transition)
+            _printStateTimer?.Dispose();
+            _printStateTimer = null;
+        }
+        #endregion
+
         #region Command Handlers
         /// <summary>
         /// Handles a status request from the host
         /// </summary>
         private void HandleStatusRequest()
         {
-            var args = new TclStatusRequestEventArgs();
-            StatusRequested?.Invoke(this, args);
-            
-            // Format and queue status response
-            var response = FormatStatusResponse(args.Status);
-            QueueResponse(response);
+            _logger?.LogInformation("Handling explicit status request from host");
+            var response = BuildExtendedStatusResponse();
+            ResponseReady?.Invoke(this, new TclResponseEventArgs(response));
         }
 
         /// <summary>
@@ -471,12 +606,12 @@ namespace Paycheck4.Core.Protocol
             // Send initial status immediately
             SendExtendedStatusResponse();
             
-            // Send status every 5 seconds continuously
+            // Send status every StatusReportingInterval milliseconds continuously
             _ = Task.Run(async () =>
             {
                 while (_isRunning)
                 {
-                    await Task.Delay(5000);
+                    await Task.Delay(_statusReportingInterval);
                     if (_isRunning)
                     {
                         _logger?.LogInformation("Sending periodic extended status");
@@ -514,10 +649,6 @@ namespace Paycheck4.Core.Protocol
         {
             _logger?.LogInformation("Building and sending extended status response");
             var response = BuildExtendedStatusResponse();
-            
-            // Log the response bytes
-            var hexString = BitConverter.ToString(response).Replace("-", " ");
-            _logger?.LogInformation("Extended status response: {ByteCount} bytes - {HexData}", response.Length, hexString);
             
             ResponseReady?.Invoke(this, new TclResponseEventArgs(response));
         }
