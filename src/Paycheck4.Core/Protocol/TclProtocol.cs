@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace Paycheck4.Core.Protocol
@@ -39,7 +40,6 @@ namespace Paycheck4.Core.Protocol
         private readonly Queue<byte[]> _responseQueue = new Queue<byte[]>();
         private readonly AutoResetEvent _responseEvent = new AutoResetEvent(false);
         private readonly ILogger<TclProtocol>? _logger;
-        private bool _extendedStatusSent = false;
         private bool _isRunning = false;
         private int _statusReportingInterval = 5000;
         
@@ -55,6 +55,12 @@ namespace Paycheck4.Core.Protocol
         private readonly int _validationDelayInterval;
         private readonly int _busyStateChangeInterval;
         private readonly int _tofStateChangeInterval;
+        private char _currentTemplateId = ' '; // Current template being processed (0x20 until first print command)
+        
+        // PaperInChute flag simulation
+        private System.Threading.Timer? _paperInChuteTimer;
+        private readonly int _paperInChuteSetInterval;
+        private readonly int _paperInChuteClearInterval;
         
         // Extended status data
         private byte _unitAddress = 0x00;
@@ -64,7 +70,6 @@ namespace Paycheck4.Core.Protocol
         private byte _statusFlags3 = (byte)StatusFlag3.Unmask;
         private byte _statusFlags4 = (byte)StatusFlag4.Unmask;
         private byte _statusFlags5 = (byte)(StatusFlag5.Unmask | StatusFlag5.ValidationDone | StatusFlag5.AtTopOfForm | StatusFlag5.ResetPowerUp);
-        private string _tempNumber = "P9";
         
         /// <summary>
         /// Event raised when a TCL command is received and parsed
@@ -94,7 +99,9 @@ namespace Paycheck4.Core.Protocol
             int printStartDelayInterval = 3000,
             int validationDelayInterval = 18000,
             int busyStateChangeInterval = 20000,
-            int tofStateChangeInterval = 4000)
+            int tofStateChangeInterval = 4000,
+            int paperInChuteSetInterval = 2000,
+            int paperInChuteClearInterval = 3000)
         {
             _logger = logger;
             _statusReportingInterval = statusReportingInterval;
@@ -102,6 +109,8 @@ namespace Paycheck4.Core.Protocol
             _validationDelayInterval = validationDelayInterval;
             _busyStateChangeInterval = busyStateChangeInterval;
             _tofStateChangeInterval = tofStateChangeInterval;
+            _paperInChuteSetInterval = paperInChuteSetInterval;
+            _paperInChuteClearInterval = paperInChuteClearInterval;
         }
         #endregion
 
@@ -187,9 +196,6 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         public void ProcessIncomingData(byte[] data, int offset, int count)
         {
-            // Mark that we've received data (host is connected)
-            _extendedStatusSent = true;
-            
             // Append raw bytes to buffer by decoding in-place
             for (int i = 0; i < count; i++)
             {
@@ -216,7 +222,7 @@ namespace Paycheck4.Core.Protocol
             {
                 var bufferLength = _messageBuffer.Length;
                 
-                // Find start of message
+                // Find start of message (must be '^' for valid TCL commands)
                 int startIndex = -1;
                 for (int i = searchStart; i < bufferLength; i++)
                 {
@@ -294,14 +300,9 @@ namespace Paycheck4.Core.Protocol
                 // No complete messages found
                 var bufferLength = _messageBuffer.Length;
                 
-                if (bufferLength > 0 && (DateTime.UtcNow - _lastReceiveTime).TotalMilliseconds > MessageTimeoutMs)
+                if (bufferLength > 0)
                 {
-                    _logger?.LogError("Incomplete message received (timeout) - discarding {Length} bytes", bufferLength);
-                    _messageBuffer.Clear();
-                }
-                else if (bufferLength > 0)
-                {
-                    // Find if there's a start marker
+                    // Find if there's a start marker (^)
                     int startIndex = -1;
                     for (int i = 0; i < bufferLength; i++)
                     {
@@ -312,14 +313,36 @@ namespace Paycheck4.Core.Protocol
                         }
                     }
                     
-                    // Remove junk before the start marker
+                    // Check if timeout has expired
+                    var timeSinceLastReceive = (DateTime.UtcNow - _lastReceiveTime).TotalMilliseconds;
+                    var isTimeout = timeSinceLastReceive > MessageTimeoutMs;
+                    
                     if (startIndex > 0)
                     {
+                        // Remove junk before the start marker (log immediately as error)
+                        if (_logger != null && _logger.IsEnabled(LogLevel.Warning))
+                        {
+                            var junkData = _messageBuffer.ToString(0, startIndex);
+                            _logger.LogWarning("Discarding {Length} bytes of incorrectly formatted data before valid command marker: {Data}", startIndex, junkData);
+                        }
                         _messageBuffer.Remove(0, startIndex);
                     }
-                    else if (startIndex == -1 && (DateTime.UtcNow - _lastReceiveTime).TotalMilliseconds > MessageTimeoutMs)
+                    else if (startIndex == -1)
                     {
-                        _logger?.LogError("No message start marker found (timeout) - discarding {Length} bytes", bufferLength);
+                        // No ^ found at all - this is invalid data (possibly echo response)
+                        // Log immediately at warning level and discard
+                        if (_logger != null && _logger.IsEnabled(LogLevel.Warning))
+                        {
+                            var invalidData = _messageBuffer.ToString();
+                            _logger.LogWarning("Received data without valid command marker ('^') - discarding {Length} bytes of incorrectly formatted data (waited {Time}ms): {Data}", 
+                                bufferLength, timeSinceLastReceive, invalidData);
+                        }
+                        _messageBuffer.Clear();
+                    }
+                    else if (isTimeout)
+                    {
+                        // Has ^ at position 0 but incomplete message and timeout expired
+                        _logger?.LogError("Incomplete message received (timeout after {Time}ms) - discarding {Length} bytes", timeSinceLastReceive, bufferLength);
                         _messageBuffer.Clear();
                     }
                 }
@@ -331,35 +354,75 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         private void ProcessCompleteMessage(int startIndex, int endIndex)
         {
+            var messageLength = endIndex - startIndex + 1;
+            
+            // All valid TCL commands start with '^' and end with '^'
+            if (_messageBuffer[startIndex] != '^' || _messageBuffer[endIndex] != '^')
+            {
+                // This is likely an echo of our status response (starts with '*') or other invalid data
+                if (_logger != null && _logger.IsEnabled(LogLevel.Warning))
+                {
+                    var message = _messageBuffer.ToString(startIndex, messageLength);
+                    _logger.LogWarning("Received incorrectly formatted message (expected '^...^' format): {Message}", message);
+                }
+                return;
+            }
+            
             // Check message type by examining buffer directly
+            
             // Pattern: ^P|... for print command
-            if (endIndex - startIndex >= 3 && 
-                _messageBuffer[startIndex] == '^' &&
+            if (messageLength >= 5 && 
                 _messageBuffer[startIndex + 1] == 'P' &&
                 _messageBuffer[startIndex + 2] == '|' &&
-                _messageBuffer[endIndex - 1] == '|' &&
-                _messageBuffer[endIndex] == '^')
+                _messageBuffer[endIndex - 1] == '|')
             {
-                // Only allocate string when we need to parse it
-                var message = _messageBuffer.ToString(startIndex, endIndex - startIndex + 1);
+                var message = _messageBuffer.ToString(startIndex, messageLength);
                 var printCommand = ParsePrintTemplateCommand(message);
                 if (printCommand != null)
                 {
                     _logger?.LogInformation("Print command detected: Template={Template}, Copies={Copies}, Fields={FieldCount}",
                         printCommand.TemplateId, printCommand.Copies, printCommand.PrintFields.Count);
-                    
-                    // Start the print job state machine
-                    StartPrintJob();
+                    StartPrintJob(printCommand.TemplateId);
                 }
+                return;
             }
-            else
+            
+            // Pattern: ^S|^ for status request
+            if (messageLength == 4 &&
+                _messageBuffer[startIndex + 1] == 'S' &&
+                _messageBuffer[startIndex + 2] == '|')
             {
-                // Unknown command - only allocate for logging
-                if (_logger != null && _logger.IsEnabled(LogLevel.Warning))
-                {
-                    var message = _messageBuffer.ToString(startIndex, endIndex - startIndex + 1);
-                    _logger.LogWarning("Unknown or unsupported command: {Message}", message);
-                }
+                _logger?.LogInformation("Status request command received");
+                HandleStatusRequest();
+                return;
+            }
+            
+            // Pattern: ^Se|^ for extended status request
+            if (messageLength == 5 &&
+                _messageBuffer[startIndex + 1] == 'S' &&
+                _messageBuffer[startIndex + 2] == 'e' &&
+                _messageBuffer[startIndex + 3] == '|')
+            {
+                _logger?.LogInformation("Extended status request command received");
+                HandleExtendedStatusRequest();
+                return;
+            }
+            
+            // Pattern: ^C|^ for clear software error flags
+            if (messageLength == 4 &&
+                _messageBuffer[startIndex + 1] == 'C' &&
+                _messageBuffer[startIndex + 2] == '|')
+            {
+                _logger?.LogInformation("Clear error flags command received");
+                HandleClearErrorFlags();
+                return;
+            }
+            
+            // Unknown/unrecognized command - log error
+            if (_logger != null && _logger.IsEnabled(LogLevel.Error))
+            {
+                var message = _messageBuffer.ToString(startIndex, messageLength);
+                _logger.LogError("Unrecognized command received: {Message}", message);
             }
         }
         
@@ -457,7 +520,7 @@ namespace Paycheck4.Core.Protocol
         /// <summary>
         /// Starts the print job state machine
         /// </summary>
-        private void StartPrintJob()
+        private void StartPrintJob(char templateId)
         {
             if (_currentPrintState != PrintState.IdleTOF)
             {
@@ -465,10 +528,19 @@ namespace Paycheck4.Core.Protocol
                 return;
             }
             
-            _logger?.LogInformation("Starting print job - transitioning from IdleTOF, starting PrintStartDelayTimer ({Interval}ms)", _printStartDelayInterval);
+            // Check if we already have a timer running (print job already started but not yet transitioned)
+            if (_printStateTimer != null)
+            {
+                _logger?.LogError("Print command received while previous print job is still initializing. Ignoring command.");
+                return;
+            }
+            
+            // Save the template ID for use in status responses
+            _currentTemplateId = templateId;
+            
+            _logger?.LogInformation("Starting print job for template {Template} - transitioning from IdleTOF, starting PrintStartDelayTimer ({Interval}ms)", templateId, _printStartDelayInterval);
             
             // Start the print start delay timer
-            _printStateTimer?.Dispose();
             _printStateTimer = new System.Threading.Timer(
                 _ => TransitionToBusyNotTOFValClear(),
                 null,
@@ -510,6 +582,15 @@ namespace Paycheck4.Core.Protocol
             _statusFlags5 |= (byte)StatusFlag5.ValidationDone;
             
             _logger?.LogInformation("Transitioned to BusyValDone - ValidationDone=SET. Starting BusyStateChangeTimer ({Interval}ms)", _busyStateChangeInterval);
+            
+            // Start (or restart) the PaperInChute flag simulation
+            _paperInChuteTimer?.Dispose();
+            _paperInChuteTimer = new System.Threading.Timer(
+                _ => SetPaperInChute(),
+                null,
+                _paperInChuteSetInterval,
+                Timeout.Infinite);
+            _logger?.LogInformation("Starting PaperInChuteSetTimer ({Interval}ms)", _paperInChuteSetInterval);
             
             // Start busy state change timer
             _printStateTimer?.Dispose();
@@ -559,6 +640,42 @@ namespace Paycheck4.Core.Protocol
         }
         #endregion
 
+        #region PaperInChute Flag Simulation
+        /// <summary>
+        /// Sets the PaperInChute flag and starts the clear timer
+        /// </summary>
+        private void SetPaperInChute()
+        {
+            // Set the PaperInChute bit
+            _statusFlags3 |= (byte)StatusFlag3.PaperInChute;
+            
+            _logger?.LogInformation("PaperInChute flag SET. Starting PaperInChuteClearTimer ({Interval}ms)", _paperInChuteClearInterval);
+            
+            // Start the clear timer
+            _paperInChuteTimer?.Dispose();
+            _paperInChuteTimer = new System.Threading.Timer(
+                _ => ClearPaperInChute(),
+                null,
+                _paperInChuteClearInterval,
+                Timeout.Infinite);
+        }
+        
+        /// <summary>
+        /// Clears the PaperInChute flag
+        /// </summary>
+        private void ClearPaperInChute()
+        {
+            // Clear the PaperInChute bit
+            _statusFlags3 &= (byte)~StatusFlag3.PaperInChute;
+            
+            _logger?.LogInformation("PaperInChute flag CLEARED");
+            
+            // Dispose timer
+            _paperInChuteTimer?.Dispose();
+            _paperInChuteTimer = null;
+        }
+        #endregion
+
         #region Command Handlers
         /// <summary>
         /// Handles a status request from the host
@@ -568,6 +685,29 @@ namespace Paycheck4.Core.Protocol
             _logger?.LogInformation("Handling explicit status request from host");
             var response = BuildExtendedStatusResponse();
             ResponseReady?.Invoke(this, new TclResponseEventArgs(response));
+        }
+        
+        /// <summary>
+        /// Handles an extended status request from the host
+        /// </summary>
+        private void HandleExtendedStatusRequest()
+        {
+            _logger?.LogInformation("Handling extended status request from host");
+            // Same as regular status request - send extended status
+            var response = BuildExtendedStatusResponse();
+            ResponseReady?.Invoke(this, new TclResponseEventArgs(response));
+        }
+        
+        /// <summary>
+        /// Handles clear error flags command from the host
+        /// </summary>
+        private void HandleClearErrorFlags()
+        {
+            _logger?.LogInformation("Clearing software error flags");
+            
+            // TODO: Implement clearing of error flags
+            // For now, just log that command was received
+            // Future: Clear specific error bits in status flags
         }
 
         /// <summary>
@@ -635,9 +775,6 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         public void ProcessData(byte[] data, int offset, int count)
         {
-            // Mark that we've received data (host is connected)
-            _extendedStatusSent = true;
-            
             // Process the incoming data
             ProcessIncomingData(data, offset, count);
         }
@@ -677,8 +814,8 @@ namespace Paycheck4.Core.Protocol
             response.Add((byte)'|');
             response.Add(_statusFlags5);
             
-            // Temp number and end delimiter (ASCII)
-            response.AddRange(Encoding.ASCII.GetBytes($"|{_tempNumber}|*"));
+            // Template number and end delimiter (ASCII)
+            response.AddRange(Encoding.ASCII.GetBytes($"|P{_currentTemplateId}|*"));
             
             return response.ToArray();
         }

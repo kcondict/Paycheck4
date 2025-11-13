@@ -48,7 +48,9 @@ namespace Paycheck4.Core
             int printStartDelayInterval = 3000,
             int validationDelayInterval = 18000,
             int busyStateChangeInterval = 20000,
-            int tofStateChangeInterval = 4000)
+            int tofStateChangeInterval = 4000,
+            int paperInChuteSetInterval = 2000,
+            int paperInChuteClearInterval = 3000)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _usbManager = new UsbGadgetManager(usbLogger ?? throw new ArgumentNullException(nameof(usbLogger)));
@@ -58,7 +60,9 @@ namespace Paycheck4.Core
                 printStartDelayInterval,
                 validationDelayInterval,
                 busyStateChangeInterval,
-                tofStateChangeInterval);
+                tofStateChangeInterval,
+                paperInChuteSetInterval,
+                paperInChuteClearInterval);
 
             // Wire up event handlers
             _usbManager.DataReceived += OnUsbDataReceived;
@@ -136,20 +140,24 @@ namespace Paycheck4.Core
             Status = e.NewStatus;
         }
         
-        private async void OnProtocolResponseReady(object? sender, TclResponseEventArgs e)
+        private void OnProtocolResponseReady(object? sender, TclResponseEventArgs e)
         {
-            try
+            // Fire and forget - don't block the protocol broadcast loop
+            _ = Task.Run(async () =>
             {
-                _logger.LogInformation("Sending protocol response: {ByteCount} bytes", e.Response.Length);
-                var hexString = BitConverter.ToString(e.Response).Replace("-", " ");
-                _logger.LogInformation("Response data: {HexData}", hexString);
-                await _usbManager.SendAsync(e.Response, 0, e.Response.Length);
-                _logger.LogInformation("Protocol response sent successfully");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to send protocol response");
-            }
+                try
+                {
+                    _logger.LogInformation("Sending protocol response: {ByteCount} bytes", e.Response.Length);
+                    var hexString = BitConverter.ToString(e.Response).Replace("-", " ");
+                    _logger.LogInformation("Response data: {HexData}", hexString);
+                    await _usbManager.SendAsync(e.Response, 0, e.Response.Length);
+                    _logger.LogInformation("Protocol response sent successfully");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to send protocol response");
+                }
+            });
         }
 
         private void OnStatusChanged(PrinterStatusEventArgs e)
@@ -166,10 +174,7 @@ namespace Paycheck4.Core
             _logger.LogInformation("Disposing printer emulator");
             Stop();
             
-            // Close USB connection
-            Task.Run(_usbManager.CloseAsync).Wait();
-            
-            // Dispose USB manager if it implements IDisposable
+            // Dispose USB manager (which will call CloseAsync internally)
             if (_usbManager is IDisposable disposableManager)
             {
                 disposableManager.Dispose();

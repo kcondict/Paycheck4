@@ -1,5 +1,7 @@
 using System;
-using System.IO.Ports;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -9,29 +11,60 @@ namespace Paycheck4.Core.Usb
 	/// <summary>
 	/// Manages USB gadget communication using USB serial (ACM)
 	/// Assumes USB gadget mode is already configured on the system
+	/// Note: Uses native Linux syscalls instead of FileStream for Mono compatibility
 	/// </summary>
 	public class UsbGadgetManager : IUsbGadgetManager, IDisposable
 	{
-		#region Constants
-		private const string SerialDevicePath = "/dev/ttyGS0";
-		private const int BufferSize = 8192;
-		#endregion
+	#region P/Invoke for Linux syscalls
+	[StructLayout(LayoutKind.Sequential)]
+	private struct pollfd
+	{
+		public int fd;
+		public short events;
+		public short revents;
+	}
 
-		#region Fields
-		private readonly ILogger<UsbGadgetManager> _logger;
-		private readonly CancellationTokenSource _cancellationSource;
-		private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
-		private SerialPort? _serialPort;
-		private Task? _readTask;
-		private bool _isDisposed;
-		#endregion
+	private const short POLLIN = 0x0001;
+	private const int O_RDWR = 0x0002;
+	private const int O_NONBLOCK = 0x0800;
 
-		#region Events
-		/// <summary>
-		/// Event raised when data is received from the host
-		/// </summary>
-		public event EventHandler<DataReceivedEventArgs>? DataReceived;
-		#endregion
+	[DllImport("libc", SetLastError = true)]
+	private static extern int open([MarshalAs(UnmanagedType.LPStr)] string pathname, int flags);
+
+	[DllImport("libc", SetLastError = true)]
+	private static extern int close(int fd);
+
+	[DllImport("libc", SetLastError = true)]
+	private static extern int read(int fd, byte[] buf, int count);
+
+	[DllImport("libc", SetLastError = true)]
+	private static extern int write(int fd, byte[] buf, int count);
+
+	[DllImport("libc", SetLastError = true)]
+	private static extern int poll(pollfd[] fds, uint nfds, int timeout);
+	#endregion
+
+	#region Constants
+	private const string SerialDevicePath = "/dev/ttyGS0";
+	private const int BufferSize = 8192;
+	#endregion
+
+	#region Fields
+	private readonly ILogger<UsbGadgetManager> _logger;
+	private readonly CancellationTokenSource _cancellationSource;
+	private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
+	private int _readFd = -1;   // Separate file descriptor for reading
+	private int _writeFd = -1;  // Separate file descriptor for writing
+	private Task? _readTask;
+	private bool _isDisposed;
+	#endregion
+
+	#region Events
+	/// <summary>
+	/// Event raised when data is received from the host
+	/// </summary>
+	public event EventHandler<DataReceivedEventArgs>? DataReceived;
+	#endregion
 
 		#region Constructor
 		public UsbGadgetManager(ILogger<UsbGadgetManager> logger)
@@ -59,24 +92,32 @@ namespace Paycheck4.Core.Usb
 						"Ensure the USB serial gadget is configured.");
 				}
 
-				// Open the device using SerialPort
-				_serialPort = new SerialPort(SerialDevicePath)
-				{
-					BaudRate = 9600,
-					Parity = Parity.None,
-					DataBits = 8,
-					StopBits = StopBits.One,
-					Handshake = Handshake.None,
-					ReadTimeout = 100,
-					WriteTimeout = 1000
-				};
+			// Open the device using native open() syscall
+			// Use separate file descriptors for read and write to prevent loopback
+			_readFd = open(SerialDevicePath, O_RDWR | O_NONBLOCK);
+			
+			if (_readFd < 0)
+			{
+				var errno = Marshal.GetLastWin32Error();
+				throw new InvalidOperationException($"Failed to open {SerialDevicePath} for reading, errno: {errno}");
+			}
 
-				_serialPort.Open();
+			_writeFd = open(SerialDevicePath, O_RDWR | O_NONBLOCK);
+			
+			if (_writeFd < 0)
+			{
+				var errno = Marshal.GetLastWin32Error();
+				close(_readFd);
+				_readFd = -1;
+				throw new InvalidOperationException($"Failed to open {SerialDevicePath} for writing, errno: {errno}");
+			}
 
-				_logger.LogInformation("USB gadget interface initialized successfully");
+			_logger.LogInformation("Opened {Device} with read_fd={ReadFd}, write_fd={WriteFd}", 
+				SerialDevicePath, _readFd, _writeFd);
+			_logger.LogInformation("USB gadget interface initialized successfully");
 
-				// Start read loop
-				_readTask = Task.Run(() => ReadLoopAsync(_cancellationSource.Token));
+			// Start read loop
+			_readTask = Task.Run(() => ReadLoopAsync(_cancellationSource.Token));
 
 				await Task.CompletedTask;
 			}
@@ -92,7 +133,7 @@ namespace Paycheck4.Core.Usb
 		/// </summary>
 		public async Task SendAsync(byte[] data, int offset, int count)
 		{
-			if (_serialPort == null || !_serialPort.IsOpen)
+			if (_writeFd < 0)
 			{
 				throw new InvalidOperationException("USB gadget interface not initialized");
 			}
@@ -107,9 +148,17 @@ namespace Paycheck4.Core.Usb
 			try
 			{
 				_logger.LogInformation("Starting write of {Count} bytes to USB host", count);
-				// SerialPort.Write is synchronous, wrap in Task.Run
-				await Task.Run(() => _serialPort.Write(data, offset, count), _cancellationSource.Token);
-				_logger.LogInformation("Sent {Count} bytes to USB host successfully", count);
+				
+				// Use native write() syscall on the write file descriptor
+				var bytesWritten = write(_writeFd, data.Skip(offset).Take(count).ToArray(), count);
+				
+				if (bytesWritten < 0)
+				{
+					var errno = Marshal.GetLastWin32Error();
+					throw new IOException($"Write failed, errno: {errno}");
+				}
+				
+				_logger.LogInformation("Sent {Count} bytes to USB host successfully", bytesWritten);
 			}
 			catch (OperationCanceledException)
 			{
@@ -131,23 +180,16 @@ namespace Paycheck4.Core.Usb
 		/// </summary>
 		public async Task CloseAsync()
 		{
+			// Prevent multiple calls
+			if (_readFd < 0 && _writeFd < 0)
+			{
+				return;
+			}
+
 			_logger.LogInformation("Closing USB gadget interface");
 			
 			// Cancel the token first
 			_cancellationSource.Cancel();
-			
-			// Close the stream to unblock any pending reads
-			try
-			{
-				if (_serialPort != null && _serialPort.IsOpen)
-				{
-					_serialPort.Close();
-				}
-			}
-			catch (Exception ex)
-			{
-				_logger.LogWarning(ex, "Exception while closing serial port");
-			}
 			
 			// Wait for read task to complete (with timeout)
 			if (_readTask != null)
@@ -166,71 +208,99 @@ namespace Paycheck4.Core.Usb
 				}
 			}
 
-			// Dispose the stream
+			// Close both file descriptors
 			try
 			{
-				_serialPort?.Dispose();
+				if (_readFd >= 0)
+				{
+					close(_readFd);
+					_readFd = -1;
+				}
+				if (_writeFd >= 0)
+				{
+					close(_writeFd);
+					_writeFd = -1;
+				}
 			}
 			catch (Exception ex)
 			{
-				_logger.LogWarning(ex, "Exception while disposing serial port");
+				_logger.LogWarning(ex, "Exception while closing device");
 			}
-			
-			_serialPort = null;
 
 			_logger.LogInformation("USB gadget interface closed");
 		}
 		#endregion
 
-		#region Private Methods
-		private async Task ReadLoopAsync(CancellationToken cancellationToken)
+	#region Private Methods
+	private async Task ReadLoopAsync(CancellationToken cancellationToken)
+	{
+		var buffer = new byte[BufferSize];
+
+		_logger.LogInformation("USB read loop started");
+		_logger.LogInformation("File descriptor for /dev/ttyGS0 - read: {ReadFd}, write: {WriteFd}", _readFd, _writeFd);
+
+		try
 		{
-			var buffer = new byte[BufferSize];
-
-			_logger.LogInformation("USB read loop started");
-
-			try
+			while (!cancellationToken.IsCancellationRequested && _readFd >= 0)
 			{
-				while (!cancellationToken.IsCancellationRequested && _serialPort != null && _serialPort.IsOpen)
+				try
 				{
-					try
+					// Use poll() to check if data is available on the READ descriptor only (100ms timeout)
+					var fds = new[] { new pollfd { fd = _readFd, events = POLLIN, revents = 0 } };
+					var pollResult = poll(fds, 1, 100);
+
+					if (pollResult < 0)
 					{
-						// Check if data is available before trying to read
-						if (_serialPort.BytesToRead > 0)
-						{
-							var bytesRead = await Task.Run(() => _serialPort.Read(buffer, 0, buffer.Length), cancellationToken);
-							
-							if (bytesRead > 0)
-							{
-								var hexString = BitConverter.ToString(buffer, 0, bytesRead).Replace("-", " ");
-								_logger.LogInformation("Received {BytesRead} bytes from USB host: {HexData}", bytesRead, hexString);
-								OnDataReceived(buffer, 0, bytesRead);
-							}
-						}
-						else
-						{
-							// Small delay to avoid busy waiting
-							await Task.Delay(10, cancellationToken);
-						}
+						var errno = Marshal.GetLastWin32Error();
+						_logger.LogError("poll() failed, errno: {Errno}", errno);
+						await Task.Delay(1000, cancellationToken);
+						continue;
 					}
-					catch (OperationCanceledException)
+
+					if (pollResult == 0)
 					{
-						break;
+						// Timeout - no data available
+						continue;
 					}
-					catch (Exception ex)
+
+					// Data is available - read it from the READ descriptor
+					var bytesRead = read(_readFd, buffer, buffer.Length);
+					
+					if (bytesRead > 0)
 					{
-						_logger.LogError(ex, "Error reading from USB device");
+						var hexString = BitConverter.ToString(buffer, 0, bytesRead).Replace("-", " ");
+						_logger.LogInformation("Received {BytesRead} bytes from USB host: {HexData}", bytesRead, hexString);
+						OnDataReceived(buffer, 0, bytesRead);
+					}
+					else if (bytesRead == 0)
+					{
+						_logger.LogWarning("Read returned 0 bytes - device may be disconnected");
+						await Task.Delay(1000, cancellationToken);
+					}
+					else
+					{
+						// Error
+						var errno = Marshal.GetLastWin32Error();
+						_logger.LogError("read() failed, errno: {Errno}", errno);
 						await Task.Delay(1000, cancellationToken);
 					}
 				}
-			}
-			finally
-			{
-				_logger.LogInformation("USB read loop stopped");
+				catch (OperationCanceledException)
+				{
+					break;
+				}
+				catch (Exception ex)
+				{
+					_logger.LogError(ex, "Error reading from USB device");
+					await Task.Delay(1000, cancellationToken);
+				}
 			}
 		}
-
-		private void OnDataReceived(byte[] data, int offset, int count)
+		finally
+		{
+			_logger.LogInformation("USB read loop stopped");
+		}
+	}		private void OnDataReceived(byte[] data, int offset, int count)
 		{
 			DataReceived?.Invoke(this, new DataReceivedEventArgs(data, offset, count));
 		}

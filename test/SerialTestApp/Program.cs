@@ -8,6 +8,7 @@ class Program
 	static async Task Main(string[] args)
 	{
 		const string portName = "COM6";
+		char currentTemplateId = '0'; // Start at '0', cycle through '0'-'9'
 		
 		Console.WriteLine("=== USB Serial Test Application ===");
 		Console.WriteLine($"Attempting to connect to {portName}...");
@@ -22,11 +23,18 @@ class Program
 				DataBits = 8,
 				StopBits = StopBits.One,
 				Handshake = Handshake.None,
+				DtrEnable = true,  // Enable DTR
+				RtsEnable = true,  // Enable RTS
 				ReadTimeout = 1000,
 				WriteTimeout = 1000
 			};
 
 			port.Open();
+			
+			// Clear any stale data in buffers
+			port.DiscardInBuffer();
+			port.DiscardOutBuffer();
+			
 			Console.WriteLine($"✓ Connected to {portName}");
 			Console.WriteLine();
 			Console.WriteLine("Commands:");
@@ -54,9 +62,10 @@ class Program
 							Console.WriteLine($"[RX] {count} bytes: {hex}");
 							Console.WriteLine($"     Text: {text.TrimEnd()}");
 							
-							// Echo the message back
-							port.Write(buffer, 0, count);
-							Console.WriteLine($"[ECHO] Sent back {count} bytes");
+							// DISABLED: Echo the message back (causing loop issue)
+							// port.Write(buffer, 0, count);
+							// Console.WriteLine($"[ECHO] Sent back {count} bytes");
+							Console.WriteLine($"[DEBUG] NOT echoing - testing if Pi receives without echo");
 							Console.WriteLine();
 						}
 						await Task.Delay(10, cts.Token);
@@ -88,12 +97,15 @@ class Program
 				{
 					if (input.Equals("p", StringComparison.OrdinalIgnoreCase))
 					{
-						// Send test print command: ^P|9|1|Field1|Field2|Field3|Field4|^
-						var printCommand = "^P|9|1|John Doe|$100.00|Check #12345|11/07/2025|^";
+						// Send test print command with incrementing template ID: ^P|<template_id>|1|Field1|Field2|Field3|Field4|^
+						var printCommand = $"^P|{currentTemplateId}|1|John Doe|$100.00|Check #12345|11/07/2025|^";
 						var bytes = Encoding.ASCII.GetBytes(printCommand);
 						port.Write(bytes, 0, bytes.Length);
-						Console.WriteLine($"[TX] Print command: {printCommand}");
+						Console.WriteLine($"[TX] Print command (Template {currentTemplateId}): {printCommand}");
 						Console.WriteLine($"     {bytes.Length} bytes: {BitConverter.ToString(bytes).Replace("-", " ")}");
+						
+						// Increment template ID, cycling from '0' to '9'
+						currentTemplateId = currentTemplateId == '9' ? '0' : (char)(currentTemplateId + 1);
 					}
 					else if (input.StartsWith("hex:", StringComparison.OrdinalIgnoreCase))
 					{
