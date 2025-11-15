@@ -13,13 +13,14 @@ A USB printer emulator for the Nanoptix PayCheck 4 thermal printer, designed to 
 ## Technical Details
 
 - **Platform**: Raspberry Pi 5 running Debian 12 (Bookworm)
-- **Framework**: .NET 8.0
+- **Framework**: .NET Framework 4.8 (via Mono runtime)
 - **Language**: C# 12
-- **USB Mode**: Gadget Mode (g_printer kernel module)
+- **USB Mode**: Gadget Mode (g_serial kernel module for CDC ACM)
 - **Protocol**: TCL (Thermal Control Language)
 - **Device IDs**: 
   - Vendor ID: 0x0f0f
   - Product ID: 0x1001
+- **Communication**: USB CDC ACM (/dev/ttyGS0 on Pi, COM6 on Windows PC)
 
 ## Project Structure
 
@@ -82,152 +83,91 @@ paycheck4/
 
 ## Building and Deploying
 
-The project includes a build script (`build.sh`) that handles building, publishing, and deployment. 
+The project targets .NET Framework 4.8 for Mono compatibility on Raspberry Pi 5.
 
-### Quick Start
+### Building for Raspberry Pi (Release)
+
+Build both Core library and Console application targeting .NET Framework 4.8:
+
 ```bash
-# Make script executable
-chmod +x build.sh
+# Build Paycheck4.Core for net48
+dotnet build src/Paycheck4.Core/Paycheck4.Core.csproj -c Release -f net48
 
-# Build and deploy debug version
-./build.sh -p -d --host 192.168.68.69 --user kcondict
+# Build Paycheck4.Console for net48
+dotnet build src/Paycheck4.Console/Paycheck4.Console.csproj -c Release -f net48
 
-# Build and deploy release version
-./build.sh -p -c Release -d --host 192.168.68.69 --user kcondict
+# Deploy to Raspberry Pi
+scp -r src/Paycheck4.Console/bin/Release/net48/* kcondict@192.168.68.69:~/paycheck4/
 ```
 
-### Build Script Options
+Or use the combined command:
 ```bash
-Options:
-  -h, --help                 Show help message
-  -c, --configuration        Set build configuration (Debug|Release) [default: Debug]
-  -r, --runtime              Set runtime identifier [default: linux-arm64]
-  -s, --self-contained       Build as self-contained application
-  -p, --publish              Publish the application instead of building
-  -o, --output               Set the output directory for publish
-  -d, --deploy               Deploy to remote host after build/publish
-  --host                     Remote host for deployment (e.g., 192.168.68.69)
-  --user                     Remote username for deployment
-  --clean                    Clean before building
-  --restore                  Restore dependencies before building
-  -v, --verbosity            Set verbosity level (quiet|minimal|normal|detailed|diagnostic)
+dotnet build src/Paycheck4.Core/Paycheck4.Core.csproj -c Release -f net48 && \
+dotnet build src/Paycheck4.Console/Paycheck4.Console.csproj -c Release -f net48 && \
+scp -r src/Paycheck4.Console/bin/Release/net48/* kcondict@192.168.68.69:~/paycheck4/
 ```
 
-### Examples
+The build output includes:
+- `Paycheck4.Console.exe` - Main application
+- `Paycheck4.Core.dll` - Core library
+- All dependencies (Microsoft.Extensions.*, Serilog.*, etc.)
+- Configuration files (appsettings.json, appsettings.Development.json)
+
+### Building PC Test Application (SerialTestApp)
+
+The PC test application is used to send test commands to the printer emulator over USB serial.
+
 ```bash
-# Simple debug build
-./build.sh
+# Build the test application
+dotnet build test/SerialTestApp/SerialTestApp.csproj -c Release
 
-# Release build
-./build.sh -c Release
-
-# Publish self-contained release
-./build.sh -p -c Release -s
-
-# Build and deploy to specific host
-./build.sh -p -d --host 192.168.68.69 --user kcondict
-
-# Full release deployment with all options
-./build.sh -p -c Release -s -d --host 192.168.68.69 --user kcondict --clean
+# Run the test application (connects to COM6 by default)
+cd test/SerialTestApp
+dotnet run --no-build -c Release
 ```
 
-The script will:
-1. Build/publish the application
-2. Set up the target directory with correct permissions
-3. Copy all required files
-4. Set appropriate execute permissions
+Available commands in SerialTestApp:
+- `p` - Send standard print command (4 fields)
+- `L` - Send large print command (15 fields x 18 chars, sent in 5 segments with 2ms pauses)
+- `hex:<bytes>` - Send raw hex bytes (e.g., `hex:48656C6C6F`)
+- `exit` - Quit the application
+- Any other text - Send as-is to the printer
 
-### Build vs. Publish
-
-The project supports two main compilation approaches: `build` and `publish`. Here's when to use each:
-
-#### dotnet build
-- Use during development and testing
-- Creates binaries in the project's `/bin` directory
-- Produces assemblies and debugging symbols
-- Does not include dependencies or runtime
-- Output remains in project structure
-- Example output structure:
-```
-bin/
-  Debug/
-    net8.0/
-      Paycheck4.Core.dll
-      Paycheck4.Console.dll
-      Paycheck4.Console.deps.json
-```
-
-#### dotnet publish
-- Use for creating deployment packages
-- Creates complete, deployable package
-- Includes all dependencies and runtime (with --self-contained)
-- Optimized for deployment
-- Can target specific platforms
-- Example output structure:
-```
-publish/
-  Paycheck4.Console
-  Paycheck4.Core.dll
-  Paycheck4.Console.dll
-  System.*.dll        # Runtime libraries
-  *.so               # Native libraries
-  appsettings.json
-  # All other dependencies
-```
+The large print command ('L') is particularly useful for testing message reassembly:
+- Sends ~293 bytes total
+- Split into 5 segments
+- 2ms pause between segments
+- Tests the WFNS (Waiting For Next Segment) state machine
 
 ### Development Build
 
-First, add projects to solution if not already added:
-```bash
-# Add projects to solution
-dotnet sln add src/Paycheck4.Core/Paycheck4.Core.csproj
-dotnet sln add src/Paycheck4.Console/Paycheck4.Console.csproj
-dotnet sln add src/Paycheck4.Tests/Paycheck4.Tests.csproj
-```
-
-Then build:
-```bash
-# Build entire solution
-dotnet build Paycheck4.sln
-
-# Or build individual projects
-dotnet build src/Paycheck4.Core/Paycheck4.Core.csproj
-dotnet build src/Paycheck4.Console/Paycheck4.Console.csproj
-dotnet build src/Paycheck4.Tests/Paycheck4.Tests.csproj
-```
-
-### Release Build
+For debugging and development:
 
 ```bash
-# Build solution in Release configuration
-dotnet build Paycheck4.sln -c Release
+# Build in Debug configuration
+dotnet build src/Paycheck4.Core/Paycheck4.Core.csproj -c Debug -f net48
+dotnet build src/Paycheck4.Console/Paycheck4.Console.csproj -c Debug -f net48
 
-# Or build specific project in Release configuration
-dotnet build src/Paycheck4.Console/Paycheck4.Console.csproj -c Release
+# Deploy to Pi
+scp -r src/Paycheck4.Console/bin/Debug/net48/* kcondict@192.168.68.69:~/paycheck4/
 ```
 
-### Publishing for Deployment
+### Running on Raspberry Pi
+
+On the Raspberry Pi, use Mono to run the .NET Framework application:
 
 ```bash
-# Create a self-contained deployment for Raspberry Pi
-dotnet publish -c Release -r linux-arm64 --self-contained
+# Navigate to deployment directory
+cd ~/paycheck4
+
+# Run with Mono
+mono Paycheck4.Console.exe
 ```
 
-The published output will be in `src/Paycheck4.Console/bin/Release/net8.0/linux-arm64/publish/`
-
-### When to Use Each Command
-
-Use `dotnet build`:
-- During active development
-- When running tests locally
-- For quick iteration and debugging
-- When you have .NET SDK installed
-
-Use `dotnet publish`:
-- Creating deployment packages
-- Building for different platforms
-- When deploying to production
-- When target machine doesn't have .NET installed
+Note: The application requires access to `/dev/ttyGS0` and may need elevated privileges:
+```bash
+sudo mono Paycheck4.Console.exe
+```
 
 ## Running Tests
 
@@ -247,20 +187,38 @@ dotnet test src/Paycheck4.Tests/Paycheck4.Tests.csproj
 Two test applications are included to verify USB serial communication:
 
 ### PC Test Application (SerialTestApp)
-Connects to the COM port and echoes back any received data.
+Connects to the COM port and allows sending test commands to the printer emulator.
 
+**Building:**
 ```bash
+# Build the application
+dotnet build test/SerialTestApp/SerialTestApp.csproj -c Release
+
+# Run the application
 cd test/SerialTestApp
-dotnet run
+dotnet run --no-build -c Release
 ```
 
-Features:
-- Auto-echoes all received messages
-- Displays hex dump of received data
-- Allows manual message sending
+**Features:**
+- Connects to COM6 by default (configurable in code)
+- Sends test print commands:
+  - `p` - Standard print command with 4 fields
+  - `L` - Large print command with 15 fields (18 chars each), sent in 5 segments with 2ms pauses
+- Send raw hex bytes: `hex:48656C6C6F`
+- Send custom text messages
+- Displays hex dump of all received data
 - Type 'exit' to quit
 
+**Test Commands:**
+- Standard Print (`p`): Sends ~55 byte message with template ID, 1 copy, and 4 data fields
+- Large Print (`L`): Sends ~293 byte message split into 5 segments to test message reassembly
+  - Each segment sent via `WriteLine()` to force USB transmission
+  - 2ms pause between segments tests the WFNS (Waiting For Next Segment) state machine
+  - Pi filters out CR/LF bytes added by `WriteLine()`
+
 ### Raspberry Pi Test Application (PiSerialTest)
+*Note: This may be deprecated in favor of the main Paycheck4.Console application*
+
 Sends timestamped messages every second and displays echoed responses.
 
 ```bash
@@ -281,24 +239,32 @@ Features:
 
 ### Testing USB Serial Communication
 
-1. Start the USB serial gadget on the Pi:
+1. Start the Paycheck4.Console application on the Pi:
 ```bash
-sudo /usr/local/bin/setup_usb_serial_device.sh
+ssh kcondict@192.168.68.69
+cd ~/paycheck4
+sudo mono Paycheck4.Console.exe
 ```
 
 2. Connect the Pi to PC via USB-C
 
-3. On PC, start the echo test app:
+3. On PC, start the test app:
 ```bash
-cd test/SerialTestApp && dotnet run
+cd test/SerialTestApp
+dotnet run --no-build -c Release
 ```
 
-4. On Pi, start the sender test app:
-```bash
-sudo /opt/PiSerialTest/PiSerialTest
-```
+4. Send test commands:
+   - Press `p` for standard print command
+   - Press `L` for large multi-segment print command
+   - Type custom messages and press Enter
 
-You should see messages being sent from Pi, echoed by PC, and received back on Pi.
+You should see:
+- PC: Messages being sent with hex dumps
+- Pi: Log messages showing message receipt, reassembly, and processing
+  - Buffer state transitions (WFFS → WFNS)
+  - Complete message processing
+  - Print job state machine transitions
 
 ## Deployment
 

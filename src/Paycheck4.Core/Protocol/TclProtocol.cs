@@ -45,8 +45,18 @@ namespace Paycheck4.Core.Protocol
         
         // Message buffering for handling partial messages
         private readonly System.Text.StringBuilder _messageBuffer = new System.Text.StringBuilder();
-        private DateTime _lastReceiveTime = DateTime.MinValue;
-        private const int MessageTimeoutMs = 10;
+        private DateTime _reassemblyTimerStart = DateTime.MinValue;
+        private const int ReassemblyIntervalMs = 20;    // 10ms for release code
+        private const int MinMessageSize = 4;
+        private const int MaxMessageSize = 1024;
+        
+        // Message reassembly state machine
+        private enum ReassemblyState
+        {
+            WaitingForFirstSegment,     // WFFS
+            WaitingForNextSegment       // WFNS
+        }
+        private ReassemblyState _reassemblyState = ReassemblyState.WaitingForFirstSegment;
         
         // Print state machine
         private PrintState _currentPrintState = PrintState.IdleTOF;
@@ -55,7 +65,8 @@ namespace Paycheck4.Core.Protocol
         private readonly int _validationDelayInterval;
         private readonly int _busyStateChangeInterval;
         private readonly int _tofStateChangeInterval;
-        private char _currentTemplateId = ' '; // Current template being processed (0x20 until first print command)
+        private char _lastPrintTemplateId = ' '; // Current template being processed (0x20 until first print command)
+        private char _statusReportTemplateId = ' '; // Template ID used for status reporting
         
         // PaperInChute flag simulation
         private System.Threading.Timer? _paperInChuteTimer;
@@ -69,7 +80,7 @@ namespace Paycheck4.Core.Protocol
         private byte _statusFlags2 = (byte)StatusFlag2.Unmask;
         private byte _statusFlags3 = (byte)StatusFlag3.Unmask;
         private byte _statusFlags4 = (byte)StatusFlag4.Unmask;
-        private byte _statusFlags5 = (byte)(StatusFlag5.Unmask | StatusFlag5.ValidationDone | StatusFlag5.AtTopOfForm | StatusFlag5.ResetPowerUp);
+        private byte _statusFlags5 = (byte)(StatusFlag5.Unmask | StatusFlag5.ValidationDone | StatusFlag5.ResetPowerUp);
         
         /// <summary>
         /// Event raised when a TCL command is received and parsed
@@ -101,7 +112,7 @@ namespace Paycheck4.Core.Protocol
             int busyStateChangeInterval = 20000,
             int tofStateChangeInterval = 4000,
             int paperInChuteSetInterval = 2000,
-            int paperInChuteClearInterval = 3000)
+            int paperInChuteClearInterval = 10000)
         {
             _logger = logger;
             _statusReportingInterval = statusReportingInterval;
@@ -196,154 +207,168 @@ namespace Paycheck4.Core.Protocol
         /// </summary>
         public void ProcessIncomingData(byte[] data, int offset, int count)
         {
-            // Append raw bytes to buffer by decoding in-place
+            // If we're in WFNS state, check if reassembly timer expired BEFORE appending new data
+            if (_reassemblyState == ReassemblyState.WaitingForNextSegment)
+            {
+                var elapsedMs = (DateTime.UtcNow - _reassemblyTimerStart).TotalMilliseconds;
+                if (elapsedMs > ReassemblyIntervalMs)
+                {
+                    _logger?.LogWarning("RCV_REASSEMBLY_TIMEOUT_ERROR: Next segment arrived after {Elapsed}ms (>{Limit}ms). Discarding previous buffer: '{OldBuffer}'",
+                        elapsedMs, ReassemblyIntervalMs, _messageBuffer.ToString());
+
+                    // Discard the old incomplete message
+                    _messageBuffer.Clear();
+                    _reassemblyState = ReassemblyState.WaitingForFirstSegment;
+                    // Continue to append the new data below
+                }
+            }
+            var newDataAdded = false;
+            
+            // Append raw bytes to buffer, filtering out CR/LF added by WriteLine()
             for (int i = 0; i < count; i++)
             {
-                _messageBuffer.Append((char)data[offset + i]);
+                byte b = data[offset + i];
+                // Skip CR (0x0D) and LF (0x0A) characters added by WriteLine()
+                if (b != 0x0D && b != 0x0A)
+                {
+                    _messageBuffer.Append((char)b);
+                    newDataAdded = true;
+                }
             }
-            _lastReceiveTime = DateTime.UtcNow;
+
+            _logger?.LogInformation("Buffer after append: {Length} bytes, State: {State}, Content: '{Content}'",
+                _messageBuffer.Length, _reassemblyState, _messageBuffer.ToString());
             
-            // Try to extract complete messages (start with '^' and end with '^')
-            ProcessBufferedMessages();
+            // Try to process the buffered data
+            if (newDataAdded)
+            {
+                ProcessBufferedMessages();
+            }
         }
         
         /// <summary>
-        /// Process complete messages from the buffer
+        /// Process complete messages from the buffer using state machine
         /// </summary>
         private void ProcessBufferedMessages()
         {
-            int lastCompleteMessageStart = -1;
-            int lastCompleteMessageEnd = -1;
-            int discardedMessageCount = 0;
+            _logger?.LogInformation("ProcessBufferedMessages: Buffer={Length} bytes, State={State}", 
+                _messageBuffer.Length, _reassemblyState);
             
-            // First pass: find ALL complete messages and only keep the last one
-            int searchStart = 0;
-            while (searchStart < _messageBuffer.Length)
+            while (_messageBuffer.Length > 0)
             {
-                var bufferLength = _messageBuffer.Length;
-                
-                // Find start of message (must be '^' for valid TCL commands)
-                int startIndex = -1;
-                for (int i = searchStart; i < bufferLength; i++)
+                if (_reassemblyState == ReassemblyState.WaitingForFirstSegment)
                 {
-                    if (_messageBuffer[i] == '^')
+                    _logger?.LogInformation("WFFS: Processing buffer with {Length} bytes", _messageBuffer.Length);
+                    
+                    // WFFS: Check minimum size
+                    if (_messageBuffer.Length < MinMessageSize)
                     {
-                        startIndex = i;
-                        break;
+                        _logger?.LogInformation("RCV_SHORT_ERROR: Message size {Size} < {MinSize} bytes. Buffer content: '{Content}'. Discarding buffer.", 
+                            _messageBuffer.Length, MinMessageSize, _messageBuffer.ToString());
+                        _messageBuffer.Clear();
+                        return;
                     }
-                }
-                
-                if (startIndex == -1)
-                    break;
-                
-                // Find end of message (second '^')
-                int endIndex = -1;
-                for (int i = startIndex + 1; i < bufferLength; i++)
-                {
-                    if (_messageBuffer[i] == '^')
+                    
+                    // WFFS: Check first byte is ^
+                    if (_messageBuffer[0] != '^')
                     {
-                        endIndex = i;
-                        break;
+                        _logger?.LogInformation("RCV_OPEN_ERROR: First byte is not '^' (got 0x{Byte:X2}). Buffer content: '{Content}'. Discarding buffer.", 
+                            (byte)_messageBuffer[0], _messageBuffer.ToString());
+                        _messageBuffer.Clear();
+                        return;
                     }
-                }
-                
-                if (endIndex == -1)
-                {
-                    // Incomplete message at end - will handle below
-                    break;
-                }
-                
-                // Found a complete message
-                if (lastCompleteMessageStart != -1)
-                {
-                    // We already had a complete message, this means we're discarding the previous one
-                    discardedMessageCount++;
-                }
-                
-                lastCompleteMessageStart = startIndex;
-                lastCompleteMessageEnd = endIndex;
-                searchStart = endIndex + 1;
-            }
-            
-            // Handle the results
-            if (lastCompleteMessageStart != -1 && lastCompleteMessageEnd != -1)
-            {
-                // We have at least one complete message - process only the last one
-                if (discardedMessageCount > 0)
-                {
-                    _logger?.LogWarning("Discarding {Count} old command message(s), processing only the most recent", discardedMessageCount);
-                }
-                
-                // Log complete message (only allocation here is for logging)
-                if (_logger != null && _logger.IsEnabled(LogLevel.Information))
-                {
-                    var messageLength = lastCompleteMessageEnd - lastCompleteMessageStart + 1;
-                    var message = _messageBuffer.ToString(lastCompleteMessageStart, messageLength);
-                    _logger.LogInformation("Received complete message from host: {Message}", message);
-                }
-                
-                // Process the last complete message
-                ProcessCompleteMessage(lastCompleteMessageStart, lastCompleteMessageEnd);
-                
-                // Remove everything up to and including the last processed message
-                // This preserves any incomplete message that may be after it
-                _messageBuffer.Remove(0, lastCompleteMessageEnd + 1);
-                
-                // Reset the receive time for the remaining buffer (incomplete message)
-                if (_messageBuffer.Length > 0)
-                {
-                    _lastReceiveTime = DateTime.UtcNow;
-                }
-            }
-            else
-            {
-                // No complete messages found
-                var bufferLength = _messageBuffer.Length;
-                
-                if (bufferLength > 0)
-                {
-                    // Find if there's a start marker (^)
-                    int startIndex = -1;
-                    for (int i = 0; i < bufferLength; i++)
+                    
+                    // WFFS: Scan for closing ^
+                    int closingIndex = -1;
+                    for (int i = 1; i < _messageBuffer.Length; i++)
                     {
                         if (_messageBuffer[i] == '^')
                         {
-                            startIndex = i;
+                            closingIndex = i;
                             break;
                         }
                     }
                     
-                    // Check if timeout has expired
-                    var timeSinceLastReceive = (DateTime.UtcNow - _lastReceiveTime).TotalMilliseconds;
-                    var isTimeout = timeSinceLastReceive > MessageTimeoutMs;
+                    if (closingIndex == -1)
+                    {
+                        // WFFS: No closing ^ found - transition to WFNS
+                        _logger?.LogInformation("WFFS: First segment received ({Size} bytes), no closing ^ found. Buffer: '{Content}'. Transitioning to WFNS.", 
+                            _messageBuffer.Length, _messageBuffer.ToString());
+                        _reassemblyState = ReassemblyState.WaitingForNextSegment;
+                        _reassemblyTimerStart = DateTime.UtcNow;
+                        return; // Wait for next segment
+                    }
                     
-                    if (startIndex > 0)
+                    // WFFS: Found closing ^ - check if it's the last byte
+                    if (closingIndex == _messageBuffer.Length - 1)
                     {
-                        // Remove junk before the start marker (log immediately as error)
-                        if (_logger != null && _logger.IsEnabled(LogLevel.Warning))
-                        {
-                            var junkData = _messageBuffer.ToString(0, startIndex);
-                            _logger.LogWarning("Discarding {Length} bytes of incorrectly formatted data before valid command marker: {Data}", startIndex, junkData);
-                        }
-                        _messageBuffer.Remove(0, startIndex);
-                    }
-                    else if (startIndex == -1)
-                    {
-                        // No ^ found at all - this is invalid data (possibly echo response)
-                        // Log immediately at warning level and discard
-                        if (_logger != null && _logger.IsEnabled(LogLevel.Warning))
-                        {
-                            var invalidData = _messageBuffer.ToString();
-                            _logger.LogWarning("Received data without valid command marker ('^') - discarding {Length} bytes of incorrectly formatted data (waited {Time}ms): {Data}", 
-                                bufferLength, timeSinceLastReceive, invalidData);
-                        }
+                        // Complete message! Process it
+                        var messageLength = closingIndex + 1;
+                        var message = _messageBuffer.ToString(0, messageLength);
+                        _logger?.LogInformation("Received complete message from host: {Length} bytes: {Message}", 
+                            messageLength, message);
+                        
+                        ProcessCompleteMessage(0, closingIndex);
                         _messageBuffer.Clear();
+                        _reassemblyState = ReassemblyState.WaitingForFirstSegment;
+                        return; // Message processed successfully
                     }
-                    else if (isTimeout)
+                    else
                     {
-                        // Has ^ at position 0 but incomplete message and timeout expired
-                        _logger?.LogError("Incomplete message received (timeout after {Time}ms) - discarding {Length} bytes", timeSinceLastReceive, bufferLength);
+                        // WFFS: Closing ^ found but bytes after it
+                        _logger?.LogWarning("RCV_CLOSE_ERROR: Found closing ^ at position {Pos} but {Extra} bytes after it. Discarding buffer.", 
+                            closingIndex, _messageBuffer.Length - closingIndex - 1);
                         _messageBuffer.Clear();
+                        _reassemblyState = ReassemblyState.WaitingForFirstSegment;
+                        return;
+                    }
+                }
+                else // _reassemblyState == ReassemblyState.WaitingForNextSegment
+                {
+                    _logger?.LogInformation("WFNS: Processing buffer with {Length} bytes", _messageBuffer.Length);
+                    
+                    // WFNS: Scan for closing ^ (timer already checked in ProcessIncomingData before appending)
+                    int closingIndex = -1;
+                    for (int i = 0; i < _messageBuffer.Length; i++)
+                    {
+                        if (_messageBuffer[i] == '^' && i > 0) // Skip the opening ^ at position 0
+                        {
+                            closingIndex = i;
+                            break;
+                        }
+                    }
+                    
+                    if (closingIndex == -1)
+                    {
+                        // WFNS: No closing ^ yet - restart timer and wait for more data
+                        _logger?.LogInformation("WFNS: Next segment received ({Size} bytes total), still no closing ^. Buffer: '{Content}'. Waiting for more data.", 
+                            _messageBuffer.Length, _messageBuffer.ToString());
+                        _reassemblyTimerStart = DateTime.UtcNow;
+                        return; // Wait for next segment
+                    }
+                    
+                    // WFNS: Found closing ^ - check if it's the last byte
+                    if (closingIndex == _messageBuffer.Length - 1)
+                    {
+                        // Complete message! Process it
+                        var messageLength = closingIndex + 1;
+                        var message = _messageBuffer.ToString(0, messageLength);
+                        _logger?.LogInformation("Received complete reassembled message from host: {Length} bytes: {Message}", 
+                            messageLength, message);
+                        
+                        ProcessCompleteMessage(0, closingIndex);
+                        _messageBuffer.Clear();
+                        _reassemblyState = ReassemblyState.WaitingForFirstSegment;
+                        return; // Message processed successfully
+                    }
+                    else
+                    {
+                        // WFNS: Closing ^ found but bytes after it
+                        _logger?.LogWarning("RCV_CLOSE_ERROR: Found closing ^ at position {Pos} but {Extra} bytes after it. Discarding buffer.", 
+                            closingIndex, _messageBuffer.Length - closingIndex - 1);
+                        _messageBuffer.Clear();
+                        _reassemblyState = ReassemblyState.WaitingForFirstSegment;
+                        return;
                     }
                 }
             }
@@ -535,8 +560,8 @@ namespace Paycheck4.Core.Protocol
                 return;
             }
             
-            // Save the template ID for use in status responses
-            _currentTemplateId = templateId;
+            // Save the template ID for later use in status responses
+            _lastPrintTemplateId = templateId;
             
             _logger?.LogInformation("Starting print job for template {Template} - transitioning from IdleTOF, starting PrintStartDelayTimer ({Interval}ms)", templateId, _printStartDelayInterval);
             
@@ -607,9 +632,12 @@ namespace Paycheck4.Core.Protocol
         private void TransitionToIdleNotTOF()
         {
             _currentPrintState = PrintState.IdleNotTOF;
-            
+
             // Clear Busy flag
             _statusFlags1 &= (byte)~StatusFlag1.Busy;
+            
+            // Now we indicate that we have processed that last print template
+            _statusReportTemplateId =_lastPrintTemplateId;
             
             _logger?.LogInformation("Transitioned to IdleNotTOF - Busy=CLEAR. Starting AtTOFTimer ({Interval}ms)", _tofStateChangeInterval);
             
@@ -815,7 +843,7 @@ namespace Paycheck4.Core.Protocol
             response.Add(_statusFlags5);
             
             // Template number and end delimiter (ASCII)
-            response.AddRange(Encoding.ASCII.GetBytes($"|P{_currentTemplateId}|*"));
+            response.AddRange(Encoding.ASCII.GetBytes($"|P{_statusReportTemplateId}|*"));
             
             return response.ToArray();
         }

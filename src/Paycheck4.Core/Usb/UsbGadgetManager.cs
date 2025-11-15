@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -24,9 +25,33 @@ namespace Paycheck4.Core.Usb
 		public short revents;
 	}
 
+	[StructLayout(LayoutKind.Sequential)]
+	private struct termios
+	{
+		public uint c_iflag;
+		public uint c_oflag;
+		public uint c_cflag;
+		public uint c_lflag;
+		public byte c_line;
+		[MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)]
+		public byte[] c_cc;
+		public uint c_ispeed;
+		public uint c_ospeed;
+	}
+
 	private const short POLLIN = 0x0001;
 	private const int O_RDWR = 0x0002;
 	private const int O_NONBLOCK = 0x0800;
+	
+	// termios flags
+	private const uint ECHO = 0x0008;
+	private const uint ECHOE = 0x0010;
+	private const uint ECHOK = 0x0020;
+	private const uint ECHONL = 0x0040;
+	private const int TCSANOW = 0;
+	
+	// errno values
+	private const int EINTR = 4;  // Interrupted system call
 
 	[DllImport("libc", SetLastError = true)]
 	private static extern int open([MarshalAs(UnmanagedType.LPStr)] string pathname, int flags);
@@ -42,6 +67,12 @@ namespace Paycheck4.Core.Usb
 
 	[DllImport("libc", SetLastError = true)]
 	private static extern int poll(pollfd[] fds, uint nfds, int timeout);
+	
+	[DllImport("libc", SetLastError = true)]
+	private static extern int tcgetattr(int fd, ref termios termios_p);
+	
+	[DllImport("libc", SetLastError = true)]
+	private static extern int tcsetattr(int fd, int optional_actions, ref termios termios_p);
 	#endregion
 
 	#region Constants
@@ -53,8 +84,7 @@ namespace Paycheck4.Core.Usb
 	private readonly ILogger<UsbGadgetManager> _logger;
 	private readonly CancellationTokenSource _cancellationSource;
 	private readonly SemaphoreSlim _writeLock = new SemaphoreSlim(1, 1);
-	private int _readFd = -1;   // Separate file descriptor for reading
-	private int _writeFd = -1;  // Separate file descriptor for writing
+	private int _deviceFd = -1;  // Single file descriptor for both read and write
 	private Task? _readTask;
 	private bool _isDisposed;
 	#endregion
@@ -92,28 +122,36 @@ namespace Paycheck4.Core.Usb
 						"Ensure the USB serial gadget is configured.");
 				}
 
-			// Open the device using native open() syscall
-			// Use separate file descriptors for read and write to prevent loopback
-			_readFd = open(SerialDevicePath, O_RDWR | O_NONBLOCK);
-			
-			if (_readFd < 0)
+		// Open the device using native open() syscall
+		// Use single file descriptor - opening twice causes USB gadget loopback
+		_deviceFd = open(SerialDevicePath, O_RDWR);  // Try WITHOUT O_NONBLOCK first
+		
+		if (_deviceFd < 0)
+		{
+			var errno = Marshal.GetLastWin32Error();
+			throw new InvalidOperationException($"Failed to open {SerialDevicePath}, errno: {errno}");
+		}			// Disable terminal echo to prevent loopback
+			var tio = new termios();
+			if (tcgetattr(_deviceFd, ref tio) == 0)
 			{
-				var errno = Marshal.GetLastWin32Error();
-				throw new InvalidOperationException($"Failed to open {SerialDevicePath} for reading, errno: {errno}");
+				// Turn off ALL echo flags
+				tio.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHONL);
+				
+				if (tcsetattr(_deviceFd, TCSANOW, ref tio) == 0)
+				{
+					_logger.LogInformation("Disabled terminal echo on {Device}", SerialDevicePath);
+				}
+				else
+				{
+					_logger.LogWarning("Failed to set terminal attributes");
+				}
+			}
+			else
+			{
+				_logger.LogWarning("Failed to get terminal attributes");
 			}
 
-			_writeFd = open(SerialDevicePath, O_RDWR | O_NONBLOCK);
-			
-			if (_writeFd < 0)
-			{
-				var errno = Marshal.GetLastWin32Error();
-				close(_readFd);
-				_readFd = -1;
-				throw new InvalidOperationException($"Failed to open {SerialDevicePath} for writing, errno: {errno}");
-			}
-
-			_logger.LogInformation("Opened {Device} with read_fd={ReadFd}, write_fd={WriteFd}", 
-				SerialDevicePath, _readFd, _writeFd);
+			_logger.LogInformation("Opened {Device} with fd={Fd}", SerialDevicePath, _deviceFd);
 			_logger.LogInformation("USB gadget interface initialized successfully");
 
 			// Start read loop
@@ -128,143 +166,162 @@ namespace Paycheck4.Core.Usb
 			}
 		}
 
-		/// <summary>
-		/// Sends data to the USB host
-		/// </summary>
-		public async Task SendAsync(byte[] data, int offset, int count)
+	/// <summary>
+	/// Sends data to the USB host
+	/// </summary>
+	public async Task SendAsync(byte[] data, int offset, int count)
+	{
+		if (_deviceFd < 0)
 		{
-			if (_writeFd < 0)
-			{
-				throw new InvalidOperationException("USB gadget interface not initialized");
-			}
-
-			// Only allow one write at a time
-			if (!await _writeLock.WaitAsync(0))
-			{
-				_logger.LogWarning("Previous write still in progress, skipping this send");
-				return;
-			}
-
-			try
-			{
-				_logger.LogInformation("Starting write of {Count} bytes to USB host", count);
-				
-				// Use native write() syscall on the write file descriptor
-				var bytesWritten = write(_writeFd, data.Skip(offset).Take(count).ToArray(), count);
-				
-				if (bytesWritten < 0)
-				{
-					var errno = Marshal.GetLastWin32Error();
-					throw new IOException($"Write failed, errno: {errno}");
-				}
-				
-				_logger.LogInformation("Sent {Count} bytes to USB host successfully", bytesWritten);
-			}
-			catch (OperationCanceledException)
-			{
-				_logger.LogWarning("Send operation canceled");
-			}
-			catch (Exception ex)
-			{
-				_logger.LogError(ex, "Failed to send data to USB host");
-				throw;
-			}
-			finally
-			{
-				_writeLock.Release();
-			}
+			throw new InvalidOperationException("USB gadget interface not initialized");
 		}
 
-		/// <summary>
-		/// Closes the USB gadget interface
-		/// </summary>
-		public async Task CloseAsync()
+		// Only allow one write at a time
+		if (!await _writeLock.WaitAsync(0))
 		{
-			// Prevent multiple calls
-			if (_readFd < 0 && _writeFd < 0)
-			{
-				return;
-			}
+			_logger.LogWarning("Previous write still in progress, skipping this send");
+			return;
+		}
 
-			_logger.LogInformation("Closing USB gadget interface");
+		try
+		{
+			_logger.LogInformation("Starting write of {Count} bytes to USB host", count);
 			
-			// Cancel the token first
-			_cancellationSource.Cancel();
+			// Use native write() syscall
+			var bytesWritten = write(_deviceFd, data.Skip(offset).Take(count).ToArray(), count);
 			
-			// Wait for read task to complete (with timeout)
-			if (_readTask != null)
+			if (bytesWritten < 0)
 			{
-				try
-				{
-					await Task.WhenAny(_readTask, Task.Delay(2000));
-					if (!_readTask.IsCompleted)
-					{
-						_logger.LogWarning("Read task did not complete within timeout");
-					}
-				}
-				catch (Exception ex)
-				{
-					_logger.LogWarning(ex, "Exception while waiting for read task");
-				}
+				var errno = Marshal.GetLastWin32Error();
+				throw new IOException($"Write failed, errno: {errno}");
 			}
+			
+			_logger.LogInformation("Sent {Count} bytes to USB host successfully", bytesWritten);
+		}
+		catch (OperationCanceledException)
+		{
+			_logger.LogWarning("Send operation canceled");
+		}
+		catch (Exception ex)
+		{
+			_logger.LogError(ex, "Failed to send data to USB host");
+			throw;
+		}
+		finally
+		{
+			_writeLock.Release();
+		}
+	}
 
-			// Close both file descriptors
+	/// <summary>
+	/// Closes the USB gadget interface
+	/// </summary>
+	public async Task CloseAsync()
+	{
+		// Prevent multiple calls
+		if (_deviceFd < 0)
+		{
+			return;
+		}
+
+		_logger.LogInformation("Closing USB gadget interface");
+		
+		// Cancel the token first
+		_cancellationSource.Cancel();
+		
+		// Wait for read task to complete (with timeout)
+		if (_readTask != null)
+		{
 			try
 			{
-				if (_readFd >= 0)
+				await Task.WhenAny(_readTask, Task.Delay(2000));
+				if (!_readTask.IsCompleted)
 				{
-					close(_readFd);
-					_readFd = -1;
-				}
-				if (_writeFd >= 0)
-				{
-					close(_writeFd);
-					_writeFd = -1;
+					_logger.LogWarning("Read task did not complete within timeout");
 				}
 			}
 			catch (Exception ex)
 			{
-				_logger.LogWarning(ex, "Exception while closing device");
+				_logger.LogWarning(ex, "Exception while waiting for read task");
 			}
-
-			_logger.LogInformation("USB gadget interface closed");
 		}
+
+		// Close the file descriptor
+		try
+		{
+			if (_deviceFd >= 0)
+			{
+				close(_deviceFd);
+				_deviceFd = -1;
+			}
+		}
+		catch (Exception ex)
+		{
+			_logger.LogWarning(ex, "Exception while closing device");
+		}
+
+		_logger.LogInformation("USB gadget interface closed");
+	}
 		#endregion
 
 	#region Private Methods
 	private async Task ReadLoopAsync(CancellationToken cancellationToken)
 	{
 		var buffer = new byte[BufferSize];
+		int pollCount = 0;
+		int successfulPolls = 0;
 
 		_logger.LogInformation("USB read loop started");
-		_logger.LogInformation("File descriptor for /dev/ttyGS0 - read: {ReadFd}, write: {WriteFd}", _readFd, _writeFd);
+		_logger.LogInformation("File descriptor for /dev/ttyGS0: {Fd}", _deviceFd);
 
 		try
 		{
-			while (!cancellationToken.IsCancellationRequested && _readFd >= 0)
+			while (!cancellationToken.IsCancellationRequested && _deviceFd >= 0)
 			{
 				try
 				{
-					// Use poll() to check if data is available on the READ descriptor only (100ms timeout)
-					var fds = new[] { new pollfd { fd = _readFd, events = POLLIN, revents = 0 } };
-					var pollResult = poll(fds, 1, 100);
+					pollCount++;
+					
+				// Use poll() to check if data is available (100ms timeout)
+				var fds = new[] { new pollfd { fd = _deviceFd, events = POLLIN, revents = 0 } };
+				var pollResult = poll(fds, 1, 100);
 
-					if (pollResult < 0)
+				if (pollResult < 0)
+				{
+					var errno = Marshal.GetLastWin32Error();
+					
+					// EINTR (errno 4) means poll() was interrupted by a signal (e.g., timer)
+					// This is normal and expected - just retry immediately
+					if (errno == EINTR)
 					{
-						var errno = Marshal.GetLastWin32Error();
-						_logger.LogError("poll() failed, errno: {Errno}", errno);
-						await Task.Delay(1000, cancellationToken);
+						_logger.LogDebug("poll() interrupted by signal (EINTR), retrying");
+						continue;
+					}
+					
+					// Other errors are actual problems
+					_logger.LogError("poll() failed, errno: {Errno}", errno);
+					await Task.Delay(1000, cancellationToken);
+					continue;
+				}
+
+				if (pollResult == 0)
+				{
+					// Timeout - no data available
+					// Log every 100 polls to show we're still alive
+					if (pollCount % 100 == 0)
+					{
+						_logger.LogDebug("Poll count: {PollCount}, successful polls: {SuccessfulPolls}", pollCount, successfulPolls);
+					}
 						continue;
 					}
 
-					if (pollResult == 0)
-					{
-						// Timeout - no data available
-						continue;
-					}
+					// poll() returned > 0, so data should be available
+					successfulPolls++;
+					_logger.LogInformation("poll() detected data available (poll #{PollNum}), revents={Revents:X4}", pollCount, fds[0].revents);
 
 					// Data is available - read it from the READ descriptor
-					var bytesRead = read(_readFd, buffer, buffer.Length);
+					var bytesRead = read(_deviceFd, buffer, buffer.Length);
+					_logger.LogInformation("read() returned {BytesRead} bytes", bytesRead);
 					
 					if (bytesRead > 0)
 					{

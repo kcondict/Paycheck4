@@ -32,6 +32,6 @@ namespace Paycheck4.Console.Configuration
         public int BusyStateChangeInterval { get; set; } = 20000;
         public int TOFStateChangeInterval { get; set; } = 4000;
         public int PaperInChuteSetInterval { get; set; } = 2000;
-        public int PaperInChuteClearInterval { get; set; } = 3000;
+        public int PaperInChuteClearInterval { get; set; } = 10000;
     }
 }

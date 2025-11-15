@@ -44,8 +44,8 @@ deploy-net48.bat
 ```
 
 Or manually:
-```bash
-scp -r src/Paycheck4.Console/bin/Release/net48/* kcondict@192.168.68.69:~/paycheck4/
+```bashscp -r src/Paycheck4.Console/bin/Release/net48/* kcondict@192.168.68.69:~/paycheck4/
+
 ```
 
 ## Running on Raspberry Pi
